@@ -5,6 +5,8 @@ description = "Foto-Archiv: Serien klassenweise versiegeln und auf HDDs sowie S3
 authors = [
     { name = "Erhard Weinell", email = "dev@weinell.de" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.44.1",

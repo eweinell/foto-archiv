@@ -77,3 +77,7 @@ Welche Datei in welchem Paket liegt, steht in `manifest.json.gz` je Version (S3 
 ```powershell
 uv run pytest -q
 ```
+
+## Lizenz
+
+MIT, siehe [LICENSE](LICENSE).

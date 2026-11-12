@@ -1,0 +1,30 @@
+[project]
+name = "foto-archiv"
+version = "0.1.0"
+description = "Foto-Archiv: Serien klassenweise versiegeln und auf HDDs sowie S3 Deep Archive sichern"
+authors = [
+    { name = "Erhard Weinell", email = "dev@weinell.de" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.44.1",
+    "platformdirs>=4.14.5",
+    "rich>=15.0.0",
+    "typer>=0.29.1",
+]
+
+[project.scripts]
+foto-archiv = "foto_archiv.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "moto[s3]>=5.2.5",
+    "pytest>=9.2.0",
+]

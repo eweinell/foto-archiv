@@ -43,6 +43,7 @@ foto-archiv hdd init E:\ --label A   # Platte einmalig als Archiv-Volume einrich
 foto-archiv seal 2026.Kenia          # Version v1 auf die angeschlossene HDD packen
 foto-archiv seal --ripe              # alle abschlussreifen/geänderten Serien
 foto-archiv push-s3                  # fehlende Pakete von der HDD nach Deep Archive
+foto-archiv push-s3 --limit 2MB/s    # mit Bandbreitenbegrenzung (auch 16Mbit, 500k; 0 = unbegrenzt)
 foto-archiv copy-hdd --from A --to B # zweite Platte nachziehen
 foto-archiv verify hdd -v B          # Platte prüfen (jährlich)
 foto-archiv verify s3
@@ -59,6 +60,10 @@ foto-archiv catalog backup           # digiKam-Datenbanken sichern
 
 Konfiguration: `%LOCALAPPDATA%\foto-archiv\config.toml`, Index: `%LOCALAPPDATA%\foto-archiv\index.sqlite`
 (eine Kopie des Index liegt auf jedem Volume unter `foto-archiv\_index\` und als Schnappschuss in S3).
+
+Dauerhafte Upload-Bandbreite: in der Konfiguration unter `[s3]` z. B. `upload_limit = "2MB/s"` eintragen;
+`push-s3 --limit` überschreibt den Wert für einen Lauf. Die Grenze gilt gemeinsam für alle parallelen
+Teil-Uploads und wird gleichmäßig im Datenstrom eingehalten (keine Lastspitzen).
 
 ## Wiederherstellung ohne Tool
 

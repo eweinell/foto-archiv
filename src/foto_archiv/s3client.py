@@ -64,6 +64,10 @@ def make_client(cfg: S3Config):
         connect_timeout=30,
         read_timeout=300,  # große Teile über langsame Leitungen
         tcp_keepalive=True,
+        # Keine SHA-256-Payload-Signatur: jeder PUT/Teil trägt ohnehin x-amz-checksum-sha256, das S3
+        # beim Empfang prüft (plus TLS). Mit Signatur würde botocore jeden Body zusätzlich komplett
+        # lesen und hashen - doppelte CPU-Last und, mit Bandbreitenlimit, halbe Geschwindigkeit.
+        s3={"payload_signing_enabled": False},
     )
     return session.client("s3", endpoint_url=cfg.endpoint_url or None, config=bc)
 

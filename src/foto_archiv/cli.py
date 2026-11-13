@@ -258,9 +258,19 @@ def verify_s3_cmd(
 
 # --------------------------------------------------------------------------- S3
 @app.command("push-s3")
-def push_s3_cmd(series: SeriesArg = None, volume: VolumeOpt = None, dry_run: DryRun = False):
+def push_s3_cmd(
+    series: SeriesArg = None,
+    volume: VolumeOpt = None,
+    limit: Annotated[
+        Optional[str],
+        typer.Option("--limit", "-l", help="Upload-Bandbreite, z. B. 2MB/s, 16Mbit, 500k (Zahl = MB/s; 0 = unbegrenzt). Standard: upload_limit aus der Konfiguration"),
+    ] = None,
+    dry_run: DryRun = False,
+):
     """Fehlende Pakete von einer HDD nach S3 (Deep Archive) hochladen."""
     a = get_app()
+    if limit is not None:
+        a.cfg.s3.upload_limit = limit
     src = None
     if volume:
         try:

@@ -36,6 +36,7 @@ from rich.table import Table
 
 from . import s3client
 from .context import App, human
+from .ratelimit import RateError, RateLimiter, format_rate, parse_rate, throttled
 from .db import utcnow
 from .layout import CATALOG_DIR, INDEX_DIR, series_year
 from .tario import BUF, PARTIAL_SUFFIX, extract_bundle, sha256_file
@@ -99,15 +100,26 @@ class S3:
     bucket: str
     prefix: str
     volume_id: str
+    limiter: RateLimiter | None = None  # gemeinsame Upload-Bremse aller Threads
 
     def key(self, relpath: str) -> str:
         return self.prefix + relpath
+
+
+def upload_rate(app: App) -> int:
+    """Konfigurierte Upload-Bandbreite in Bytes/s (0 = unbegrenzt)."""
+    try:
+        return parse_rate(app.cfg.s3.upload_limit)
+    except RateError as e:
+        _fail(app, f"upload_limit: {e}")
+    return 0
 
 
 def _connect(app: App) -> S3:
     """S3-Client erzeugen, Bucket erreichbar? S3 als Volume registrieren."""
     _require_bucket(app)
     s3c = app.cfg.s3
+    rate = upload_rate(app)
     try:
         client = s3client.make_client(s3c)
     except s3client.S3Error as e:
@@ -117,7 +129,8 @@ def _connect(app: App) -> S3:
     except (ClientError, BotoCoreError) as e:
         _fail(app, f"Bucket '{s3c.bucket}' nicht erreichbar: {s3client.describe(e)}")
     app.db.register_volume(s3c.volume_id, "s3", f"S3 {s3c.bucket}")
-    return S3(app=app, client=client, bucket=s3c.bucket, prefix=s3c.prefix, volume_id=s3c.volume_id)
+    limiter = RateLimiter(rate) if rate else None
+    return S3(app=app, client=client, bucket=s3c.bucket, prefix=s3c.prefix, volume_id=s3c.volume_id, limiter=limiter)
 
 
 def _part_size(cfg_mb: int, size: int) -> int:
@@ -215,7 +228,7 @@ def put_small(s3: S3, key: str, data: bytes, storage_class: str, metadata: dict[
         s3.client.put_object(
             Bucket=s3.bucket,
             Key=key,
-            Body=data,
+            Body=throttled(data, s3.limiter),
             StorageClass=storage_class,
             Metadata=metadata,
             ChecksumAlgorithm="SHA256",
@@ -273,7 +286,7 @@ def _upload_part(s3: S3, key: str, upload_id: str, number: int, data: bytes, che
                 Key=key,
                 UploadId=upload_id,
                 PartNumber=number,
-                Body=data,
+                Body=throttled(data, s3.limiter),  # bei Wiederholung neuer Body ab Position 0
                 ChecksumAlgorithm="SHA256",
                 ChecksumSHA256=checksum,
             )
@@ -499,11 +512,17 @@ def push_s3(app: App, series: list[str] | None, source: Volume | None, dry_run: 
             f"Geschätzte Kosten: Speicher {_usd(monthly)}/Monat ({_usd(monthly * 12)}/Jahr, "
             f"mindestens {MIN_STORAGE_MONTHS_DEEP_ARCHIVE} Monate), Anfragen einmalig {_usd(put_cost)}."
         )
+        rate = upload_rate(app)
+        if rate and sizes:
+            hours = sum(sizes) / rate / 3600
+            con.print(f"Upload-Limit {format_rate(rate)}: Dauer mindestens ≈ {hours:.1f} h.")
         if no_source:
             con.print(f"[yellow]{len(no_source)} Paket(e) ohne angeschlossene HDD-Kopie werden übersprungen.")
         return
 
     s3 = _connect(app)
+    if s3.limiter:
+        con.print(f"Upload-Limit: {format_rate(s3.limiter.rate)}")
     uploaded = existed = errors = 0
     uploaded_bytes = 0
     changed = False

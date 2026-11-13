@@ -473,3 +473,45 @@ def test_missing_bucket_config(app, capsys):
     with pytest.raises(typer.Exit):
         push_s3(app, None, None, dry_run=True)
     assert "Kein S3-Bucket" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------- Bandbreite
+
+
+def test_push_with_upload_limit(app, hdd_a, s3, capsys, monkeypatch):
+    import time as _t
+
+    from foto_archiv.ratelimit import RateLimiter
+
+    consumed = []
+    orig = RateLimiter.consume
+    monkeypatch.setattr(RateLimiter, "consume", lambda self, n: (consumed.append(n), orig(self, n)))
+
+    b = _big_series(app, hdd_a)  # 3 Teile (Multipart)
+    app.cfg.s3.upload_limit = "40MB/s"
+    app.cfg.s3.storage_class = "STANDARD"  # damit der Inhalt direkt zurückgelesen werden kann
+    push_s3(app, None, None, dry_run=True)
+    assert "Upload-Limit 40.0 MB/s" in capsys.readouterr().out
+    t0 = _t.monotonic()
+    push_s3(app, None, None, dry_run=False)
+    elapsed = _t.monotonic() - t0
+    out = capsys.readouterr().out
+    assert "Upload-Limit: 40.0 MB/s" in out
+    # alle Paketbytes liefen durch den Limiter (dazu Manifest und Index-Sicherung)
+    assert sum(consumed) >= b["size"]
+    # ... aber nur einmal (botocore darf den Body nicht zusätzlich zum Signieren lesen)
+    assert sum(consumed) < 1.3 * b["size"]
+    # ≈ 12,6 MB bei 40 MB/s ≈ 0,31 s, abzüglich 0,25 s Anfangsguthaben
+    assert elapsed >= 0.05
+    h = s3.head_object(Bucket=BUCKET, Key=_key(b["relpath"]))
+    assert h["ContentLength"] == b["size"] and h["Metadata"]["sha256"] == b["sha256"]
+    got = s3.get_object(Bucket=BUCKET, Key=_key(b["relpath"]))["Body"].read()
+    assert hashlib.sha256(got).hexdigest() == b["sha256"]
+
+
+def test_push_invalid_upload_limit(app, hdd_a, s3):
+    _sealed(app, hdd_a, "2026.Kenia")
+    app.cfg.s3.upload_limit = "ganz schnell"
+    with pytest.raises(typer.Exit):
+        push_s3(app, None, None, dry_run=False)
+    assert _keys(s3) == []

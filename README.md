@@ -61,9 +61,17 @@ foto-archiv catalog backup           # digiKam-Datenbanken sichern
 Konfiguration: `%LOCALAPPDATA%\foto-archiv\config.toml`, Index: `%LOCALAPPDATA%\foto-archiv\index.sqlite`
 (eine Kopie des Index liegt auf jedem Volume unter `foto-archiv\_index\` und als Schnappschuss in S3).
 
-Dauerhafte Upload-Bandbreite: in der Konfiguration unter `[s3]` z. B. `upload_limit = "2MB/s"` eintragen;
-`push-s3 --limit` überschreibt den Wert für einen Lauf. Die Grenze gilt gemeinsam für alle parallelen
-Teil-Uploads und wird gleichmäßig im Datenstrom eingehalten (keine Lastspitzen).
+Upload-Bandbreite dauerhaft festlegen, in der Konfiguration unter `[s3]`:
+
+```toml
+upload_limit = "2MB/s"                                    # fester Wert (leer = unbegrenzt)
+upload_schedule = ["07:00-23:00=2MB/s", "23:00-07:00=0"]  # optional: je Tageszeit, 0 = unbegrenzt
+```
+
+Beim Zeitplan gilt das erste passende Fenster (lokale Uhrzeit), außerhalb aller Fenster `upload_limit`.
+Wechsel greifen auch mitten in einem laufenden Upload. `push-s3 --limit` setzt für einen Lauf einen
+festen Wert und ignoriert den Zeitplan. Die Grenze gilt gemeinsam für alle parallelen Teil-Uploads und
+wird gleichmäßig im Datenstrom eingehalten (keine Lastspitzen).
 
 ## Wiederherstellung ohne Tool
 

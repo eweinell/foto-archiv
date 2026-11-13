@@ -263,7 +263,11 @@ def push_s3_cmd(
     volume: VolumeOpt = None,
     limit: Annotated[
         Optional[str],
-        typer.Option("--limit", "-l", help="Upload-Bandbreite, z. B. 2MB/s, 16Mbit, 500k (Zahl = MB/s; 0 = unbegrenzt). Standard: upload_limit aus der Konfiguration"),
+        typer.Option(
+            "--limit", "-l",
+            help="feste Upload-Bandbreite für diesen Lauf, z. B. 2MB/s, 16Mbit, 500k (Zahl = MB/s; 0 = unbegrenzt); "
+            "ersetzt upload_limit und upload_schedule aus der Konfiguration",
+        ),
     ] = None,
     dry_run: DryRun = False,
 ):
@@ -271,6 +275,7 @@ def push_s3_cmd(
     a = get_app()
     if limit is not None:
         a.cfg.s3.upload_limit = limit
+        a.cfg.s3.upload_schedule = []
     src = None
     if volume:
         try:

@@ -12,8 +12,10 @@ import io
 import re
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable
 
-_UNITS = {"": 1, "k": 1000, "m": 1000**2, "g": 1000**3}
 _RATE_RE = re.compile(
     r"^\s*(?P<num>\d+(?:[.,]\d+)?)\s*(?P<prefix>[kKmMgG]?)(?P<bi>i?)\s*(?P<unit>bit|Bit|BIT|b|B)?\s*(?:/s|ps)?\s*$"
 )
@@ -66,39 +68,149 @@ def format_rate(bps: int) -> str:
     return f"{bps / 1000:.0f} kB/s (≈ {bps * 8 / 1000**2:.1f} Mbit/s)"
 
 
+# ---------------------------------------------------------------------------- Zeitfenster
+
+_WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*=\s*(.+?)\s*$")
+
+
+@dataclass(frozen=True)
+class Window:
+    """Tageszeitfenster [start, end) in Minuten seit Mitternacht; darf über Mitternacht gehen."""
+
+    start: int
+    end: int
+    rate: int
+    text: str
+
+    def contains(self, minute: int) -> bool:
+        if self.start == self.end:  # 00:00-24:00 bzw. ganzer Tag
+            return True
+        if self.start < self.end:
+            return self.start <= minute < self.end
+        return minute >= self.start or minute < self.end
+
+
+def _minutes(h: str, m: str, text: str, allow_24: bool) -> int:
+    hh, mm = int(h), int(m)
+    if mm > 59 or hh > 24 or (hh == 24 and (mm or not allow_24)):
+        raise RateError(f"Ungültige Uhrzeit in '{text}'.")
+    return (hh * 60 + mm) % 1440
+
+
+def parse_window(text: str) -> Window:
+    """``"07:00-22:00=2MB/s"`` -> Window. Über Mitternacht: ``"22:00-07:00=0"`` (0 = unbegrenzt)."""
+    m = _WINDOW_RE.match(str(text))
+    if not m:
+        raise RateError(f"Ungültiges Zeitfenster '{text}' (Format: \"07:00-22:00=2MB/s\").")
+    start = _minutes(m.group(1), m.group(2), text, allow_24=False)
+    end = _minutes(m.group(3), m.group(4), text, allow_24=True)
+    return Window(start, end, parse_rate(m.group(5)), str(text).strip())
+
+
+class Schedule:
+    """Bandbreite je Tageszeit. Das erste passende Fenster gilt; sonst der Standardwert."""
+
+    def __init__(self, windows: list[Window], default: int):
+        self.windows = windows
+        self.default = default
+
+    @classmethod
+    def parse(cls, entries: list[str] | None, default: int) -> "Schedule | None":
+        if not entries:
+            return None
+        return cls([parse_window(e) for e in entries], default)
+
+    def window_at(self, when: datetime) -> Window | None:
+        minute = when.hour * 60 + when.minute
+        return next((w for w in self.windows if w.contains(minute)), None)
+
+    def rate_at(self, when: datetime) -> int:
+        w = self.window_at(when)
+        return w.rate if w else self.default
+
+    def describe(self) -> list[str]:
+        def hm(x: int) -> str:
+            return f"{x // 60:02d}:{x % 60:02d}"
+
+        lines = [f"{hm(w.start)}–{hm(w.end)}: {format_rate(w.rate)}" for w in self.windows]
+        lines.append(f"sonst: {format_rate(self.default)}")
+        return lines
+
+
+# ---------------------------------------------------------------------------- Limiter
+
+
 class RateLimiter:
     """Thread-sicherer Limiter nach dem Prinzip einer virtuellen Uhr.
 
     Jeder Verbrauch von ``n`` Bytes schiebt den Zeitpunkt, ab dem wieder gesendet werden darf,
     um ``n / rate`` Sekunden nach hinten. Ein kleines Guthaben (``burst_seconds``) gleicht
     Pausen aus, ohne längere Lastspitzen zuzulassen.
+
+    Mit ``schedule`` wird die Rate alle ``check_interval`` Sekunden an die Tageszeit angepasst,
+    auch mitten in einem laufenden Upload; ``on_change(rate)`` meldet den Wechsel.
     """
 
-    def __init__(self, rate: int, burst_seconds: float = 0.25, clock=time.monotonic, sleep=time.sleep):
-        self.rate = max(0, int(rate))
+    def __init__(
+        self,
+        rate: int,
+        burst_seconds: float = 0.25,
+        clock=time.monotonic,
+        sleep=time.sleep,
+        schedule: Schedule | None = None,
+        now: Callable[[], datetime] = datetime.now,
+        check_interval: float = 5.0,
+        on_change: Callable[[int], None] | None = None,
+    ):
         self.burst = burst_seconds
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
         self._next = clock()
+        self.schedule = schedule
+        self._now = now
+        self.check_interval = check_interval
+        self.on_change = on_change
+        self._next_check = clock() + check_interval
+        self.rate = max(0, int(schedule.rate_at(now()) if schedule else rate))
 
     @property
     def enabled(self) -> bool:
-        return self.rate > 0
+        """Müssen Bodies gedrosselt werden? Mit Zeitplan immer (die Rate kann sich ändern)."""
+        return self.rate > 0 or self.schedule is not None
 
     def set_rate(self, rate: int) -> None:
         with self._lock:
             self.rate = max(0, int(rate))
             self._next = self._clock()
 
+    def _refresh_locked(self, now: float) -> int | None:
+        if self.schedule is None or now < self._next_check:
+            return None
+        self._next_check = now + self.check_interval
+        rate = max(0, int(self.schedule.rate_at(self._now())))
+        if rate == self.rate:
+            return None
+        self.rate = rate
+        self._next = now
+        return rate
+
     def consume(self, n: int) -> None:
-        if n <= 0 or self.rate <= 0:
+        if n <= 0 or (self.rate <= 0 and self.schedule is None):
             return
+        delay = 0.0
         with self._lock:
             now = self._clock()
-            start = max(self._next, now - self.burst)
-            self._next = start + n / self.rate
-            delay = self._next - now
+            changed = self._refresh_locked(now)
+            if self.rate > 0:
+                start = max(self._next, now - self.burst)
+                self._next = start + n / self.rate
+                delay = self._next - now
+        if changed is not None and self.on_change:
+            try:
+                self.on_change(changed)
+            except Exception:
+                pass
         if delay > 0:
             self._sleep(delay)
 
@@ -167,7 +279,7 @@ class ThrottledBody(io.RawIOBase):
 
 
 def throttled(data: bytes, limiter: RateLimiter | None):
-    """Body für einen Request: unverändert ohne Limit, sonst gebremst."""
+    """Body für einen Request: unverändert ohne Limit/Zeitplan, sonst gebremst."""
     if limiter is None or not limiter.enabled:
         return data
     return ThrottledBody(data, limiter)

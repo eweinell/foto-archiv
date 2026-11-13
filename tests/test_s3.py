@@ -515,3 +515,22 @@ def test_push_invalid_upload_limit(app, hdd_a, s3):
     with pytest.raises(typer.Exit):
         push_s3(app, None, None, dry_run=False)
     assert _keys(s3) == []
+
+
+def test_push_with_upload_schedule(app, hdd_a, s3, capsys):
+    _sealed(app, hdd_a, "2026.Kenia")
+    app.cfg.s3.upload_schedule = ["00:00-24:00=50MB/s"]
+    push_s3(app, None, None, dry_run=True)
+    out = capsys.readouterr().out
+    assert "Upload-Limit nach Zeitplan" in out and "jetzt: 50.0 MB/s" in out
+    push_s3(app, None, None, dry_run=False)
+    assert "Upload-Limit nach Zeitplan" in capsys.readouterr().out
+    assert len(_keys(s3)) >= 3
+
+
+def test_push_invalid_upload_schedule(app, hdd_a, s3):
+    _sealed(app, hdd_a, "2026.Kenia")
+    app.cfg.s3.upload_schedule = ["tagsüber=2MB/s"]
+    with pytest.raises(typer.Exit):
+        push_s3(app, None, None, dry_run=False)
+    assert _keys(s3) == []

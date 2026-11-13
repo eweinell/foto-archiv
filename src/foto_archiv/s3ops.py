@@ -36,7 +36,7 @@ from rich.table import Table
 
 from . import s3client
 from .context import App, human
-from .ratelimit import RateError, RateLimiter, format_rate, parse_rate, throttled
+from .ratelimit import RateError, RateLimiter, Schedule, format_rate, parse_rate, throttled
 from .db import utcnow
 from .layout import CATALOG_DIR, INDEX_DIR, series_year
 from .tario import BUF, PARTIAL_SUFFIX, extract_bundle, sha256_file
@@ -106,20 +106,50 @@ class S3:
         return self.prefix + relpath
 
 
-def upload_rate(app: App) -> int:
-    """Konfigurierte Upload-Bandbreite in Bytes/s (0 = unbegrenzt)."""
+def upload_settings(app: App) -> tuple[int, Schedule | None]:
+    """Konfigurierte Upload-Bandbreite (Bytes/s, 0 = unbegrenzt) und optionaler Zeitplan."""
+    s3c = app.cfg.s3
     try:
-        return parse_rate(app.cfg.s3.upload_limit)
+        rate = parse_rate(s3c.upload_limit)
     except RateError as e:
         _fail(app, f"upload_limit: {e}")
-    return 0
+    entries = s3c.upload_schedule or []
+    if isinstance(entries, str):  # einzelnes Fenster als String statt Liste eingetragen
+        entries = [entries]
+    try:
+        schedule = Schedule.parse(list(entries), rate)
+    except RateError as e:
+        _fail(app, f"upload_schedule: {e}")
+    return rate, schedule
+
+
+def describe_upload_limit(app: App) -> str | None:
+    """Einzeilige Beschreibung für die Ausgabe (None = keine Begrenzung konfiguriert)."""
+    rate, schedule = upload_settings(app)
+    if schedule:
+        now = format_rate(schedule.rate_at(datetime.now()))
+        return f"Upload-Limit nach Zeitplan ({'; '.join(schedule.describe())}), jetzt: {now}"
+    if rate:
+        return f"Upload-Limit: {format_rate(rate)}"
+    return None
+
+
+def make_limiter(app: App) -> RateLimiter | None:
+    rate, schedule = upload_settings(app)
+    if not rate and not schedule:
+        return None
+
+    def changed(new_rate: int) -> None:
+        app.console.print(f"[dim]{datetime.now():%H:%M}[/] Upload-Limit jetzt: {format_rate(new_rate)}")
+
+    return RateLimiter(rate, schedule=schedule, on_change=changed)
 
 
 def _connect(app: App) -> S3:
     """S3-Client erzeugen, Bucket erreichbar? S3 als Volume registrieren."""
     _require_bucket(app)
     s3c = app.cfg.s3
-    rate = upload_rate(app)
+    limiter = make_limiter(app)  # Konfigurationsfehler vor dem ersten Netzwerkzugriff melden
     try:
         client = s3client.make_client(s3c)
     except s3client.S3Error as e:
@@ -129,7 +159,6 @@ def _connect(app: App) -> S3:
     except (ClientError, BotoCoreError) as e:
         _fail(app, f"Bucket '{s3c.bucket}' nicht erreichbar: {s3client.describe(e)}")
     app.db.register_volume(s3c.volume_id, "s3", f"S3 {s3c.bucket}")
-    limiter = RateLimiter(rate) if rate else None
     return S3(app=app, client=client, bucket=s3c.bucket, prefix=s3c.prefix, volume_id=s3c.volume_id, limiter=limiter)
 
 
@@ -512,8 +541,10 @@ def push_s3(app: App, series: list[str] | None, source: Volume | None, dry_run: 
             f"Geschätzte Kosten: Speicher {_usd(monthly)}/Monat ({_usd(monthly * 12)}/Jahr, "
             f"mindestens {MIN_STORAGE_MONTHS_DEEP_ARCHIVE} Monate), Anfragen einmalig {_usd(put_cost)}."
         )
-        rate = upload_rate(app)
-        if rate and sizes:
+        rate, schedule = upload_settings(app)
+        if schedule:
+            con.print(describe_upload_limit(app))
+        elif rate and sizes:
             hours = sum(sizes) / rate / 3600
             con.print(f"Upload-Limit {format_rate(rate)}: Dauer mindestens ≈ {hours:.1f} h.")
         if no_source:
@@ -522,7 +553,7 @@ def push_s3(app: App, series: list[str] | None, source: Volume | None, dry_run: 
 
     s3 = _connect(app)
     if s3.limiter:
-        con.print(f"Upload-Limit: {format_rate(s3.limiter.rate)}")
+        con.print(describe_upload_limit(app))
     uploaded = existed = errors = 0
     uploaded_bytes = 0
     changed = False

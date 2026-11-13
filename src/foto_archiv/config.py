@@ -46,6 +46,8 @@ class S3Config:
     part_size_mb: int = 64
     concurrency: int = 4
     upload_limit: str = ""  # Upload-Bandbreite, z. B. "2MB/s" oder "16Mbit"; leer = unbegrenzt
+    # Zeitfenster, z. B. ["07:00-23:00=2MB/s", "23:00-07:00=0"]; erstes passendes gilt, sonst upload_limit
+    upload_schedule: list[str] = field(default_factory=list)
     restore_tier: str = "Bulk"  # Bulk | Standard
     restore_days: int = 7
     endpoint_url: str = ""  # nur für Tests (z. B. moto-Server)
@@ -142,6 +144,9 @@ def render_config(cfg: Config) -> str:
         f"concurrency = {cfg.s3.concurrency}",
         "# Upload-Bandbreite begrenzen, z. B. \"2MB/s\", \"16Mbit\", \"500k\" (reine Zahl = MB/s); leer = unbegrenzt",
         f"upload_limit = {_toml_value(cfg.s3.upload_limit)}",
+        "# Zeitfenster (lokale Uhrzeit), z. B. [\"07:00-23:00=2MB/s\", \"23:00-07:00=0\"]; 0 = unbegrenzt.",
+        "# Das erste passende Fenster gilt, außerhalb aller Fenster upload_limit. Wechsel greifen auch mitten im Upload.",
+        f"upload_schedule = {_toml_value(cfg.s3.upload_schedule)}",
         f"restore_tier = {_toml_value(cfg.s3.restore_tier)}",
         f"restore_days = {cfg.s3.restore_days}",
     ]

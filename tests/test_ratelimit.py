@@ -129,3 +129,71 @@ def test_throttled_body_reads_seeks_and_counts():
     assert body.read(10**9) == data[101_000:]
     assert throttled(data, None) is data
     assert throttled(data, RateLimiter(0)) is data
+
+
+# ---------------------------------------------------------------------------- Zeitfenster
+
+from datetime import datetime as _dt
+
+from foto_archiv.ratelimit import Schedule, Window, parse_window
+
+
+def _at(hh, mm=0):
+    return _dt(2026, 11, 13, hh, mm)
+
+
+def test_parse_window_and_midnight_wrap():
+    w = parse_window("22:00-07:00=0")
+    assert (w.start, w.end, w.rate) == (22 * 60, 7 * 60, 0)
+    assert w.contains(23 * 60) and w.contains(0) and w.contains(6 * 60 + 59)
+    assert not w.contains(7 * 60) and not w.contains(12 * 60)
+    d = parse_window(" 07:00 - 22:00 = 16Mbit ")
+    assert d.rate == 2_000_000 and d.contains(7 * 60) and not d.contains(22 * 60)
+    assert parse_window("18:00-24:00=1MB/s").contains(23 * 60 + 59)
+    assert parse_window("00:00-24:00=1M").contains(12 * 60)  # ganzer Tag
+
+
+@pytest.mark.parametrize("text", ["7-22=2M", "07:00-22:00", "25:00-07:00=1M", "07:60-08:00=1M", "24:00-07:00=1M", "07:00-08:00=schnell"])
+def test_parse_window_invalid(text):
+    with pytest.raises(RateError):
+        parse_window(text)
+
+
+def test_schedule_first_match_and_default():
+    s = Schedule.parse(["07:00-18:00=2MB/s", "17:00-23:00=1MB/s"], default=500_000)
+    assert s.rate_at(_at(8)) == 2_000_000
+    assert s.rate_at(_at(17, 30)) == 2_000_000  # Überlappung: erstes Fenster gewinnt
+    assert s.rate_at(_at(20)) == 1_000_000
+    assert s.rate_at(_at(3)) == 500_000  # außerhalb: Standard
+    assert Schedule.parse([], 0) is None
+    assert s.describe()[-1].startswith("sonst: 500 kB/s")
+
+
+def test_limiter_follows_schedule_mid_upload():
+    clk = FakeClock()
+    wall = {"t": _at(22, 59)}
+    changes = []
+    s = Schedule.parse(["07:00-23:00=1MB/s", "23:00-07:00=0"], default=0)
+    lim = RateLimiter(0, burst_seconds=0.0, clock=clk, sleep=clk.sleep, schedule=s,
+                      now=lambda: wall["t"], check_interval=5.0, on_change=changes.append)
+    assert lim.rate == 1_000_000 and lim.enabled
+    lim.consume(1_000_000)
+    assert clk.slept == pytest.approx(1.0)
+    wall["t"] = _at(23, 0)  # Nacht beginnt
+    clk.t += 10  # Prüfintervall abgelaufen
+    before = clk.slept
+    lim.consume(50_000_000)
+    assert lim.rate == 0 and changes == [0]
+    assert clk.slept == before  # unbegrenzt: keine Pause
+    assert lim.enabled  # trotz Rate 0 weiter drosselbar (Zeitplan kann wieder umschalten)
+    wall["t"] = _at(7, 0)
+    clk.t += 10
+    lim.consume(500_000)
+    assert changes == [0, 1_000_000]
+    assert clk.slept - before == pytest.approx(0.5)
+
+
+def test_throttled_wraps_when_schedule_present():
+    s = Schedule.parse(["00:00-24:00=0"], default=0)
+    lim = RateLimiter(0, schedule=s)
+    assert isinstance(throttled(b"x" * 10, lim), ThrottledBody)

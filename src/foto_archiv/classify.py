@@ -15,12 +15,18 @@ VIDEO_EXT = {
     ".mp4", ".m4v", ".mov", ".mpg", ".mpeg", ".avi", ".mts", ".m2ts", ".mkv", ".3gp", ".wmv", ".webm", ".insv", ".lrv",
 }
 
+AUDIO_EXT = {
+    ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".aif", ".aiff", ".wma", ".ape", ".wv",
+    ".alac", ".dsf", ".dff", ".mka", ".mid", ".midi",
+}
+
 RAW = "raw"
 IMG_DERIVED = "img-derived"
 IMG_ORIGINAL = "img-original"
 VIDEO = "video"
+AUDIO = "audio"
 OTHER = "other"
-CLASSES = (RAW, IMG_DERIVED, IMG_ORIGINAL, VIDEO, OTHER)
+CLASSES = (RAW, IMG_DERIVED, IMG_ORIGINAL, VIDEO, AUDIO, OTHER)
 
 # typische Suffixe von Exporten: DSC0001-1.jpg, DSC0001_01.jpg, DSC0001_edit.jpg, DSC0001 (2).jpg …
 _SUFFIX_RE = re.compile(
@@ -71,6 +77,26 @@ def classify(name: str, raw_keys: set[str]) -> str:
             return IMG_DERIVED
         return IMG_ORIGINAL
     return OTHER
+
+
+def classify_media(name: str) -> str:
+    """Profil ``media`` (Videos, Musik, Sonstiges): nur nach Dateiendung, kein RAW/Export-Abgleich."""
+    ext = _ext(name)
+    if ext in RAW_EXT:
+        return RAW
+    if ext in VIDEO_EXT:
+        return VIDEO
+    if ext in AUDIO_EXT:
+        return AUDIO
+    if ext in IMG_EXT:
+        return IMG_ORIGINAL
+    return OTHER
+
+
+def classify_for(profile: str, name: str, raw_keys: set[str]) -> str:
+    if profile == "media":
+        return classify_media(name)
+    return classify(name, raw_keys)
 
 
 def is_raw_name(name: str) -> bool:

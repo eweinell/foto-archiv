@@ -63,7 +63,9 @@ def compute_status(app: App, only: list[str] | None = None) -> list[SeriesStatus
 
     out: list[SeriesStatus] = []
     for name in names:
-        st = SeriesStatus(name=name, year=series_year(name))
+        cid = name.partition("/")[0]
+        coll = app.cfg.find_collection(cid)
+        st = SeriesStatus(name=name, year=series_year(name) if coll is None or coll.year == "name" else None)
         archived = db.latest_archived(name)
         for r in db.q("SELECT path, cls, size, mtime_ns, sha256, present, slimmed FROM files WHERE series=?", (name,)):
             if not r["present"]:
@@ -95,7 +97,7 @@ def compute_status(app: App, only: list[str] | None = None) -> list[SeriesStatus
 
         has_raw = RAW in st.by_class or st.slimmed_bytes > 0
         has_derived = IMG_DERIVED in st.by_class
-        ripe = st.idle_days >= app.cfg.settle_days and (has_derived or not has_raw)
+        ripe = st.idle_days >= app.cfg.settle_days_for(cid) and (has_derived or not has_raw)
         if st.local_files == 0 and st.versions:
             st.state = "nur-archiv"
         elif st.versions == 0:
@@ -113,9 +115,11 @@ def _cls_bytes(st: SeriesStatus, *classes: str) -> int:
 def render_status(app: App, rows: list[SeriesStatus]) -> None:
     # Schmales Terminal: weniger Spalten, sonst quetscht rich die Serienspalte auf 0
     compact = app.console.width < 130
-    hidden = {"Bilder", "Video", "Ver."} if compact else set()
+    hidden = {"Bilder", "Video", "Audio", "Ver."} if compact else set()
+    if not any("audio" in st.by_class for st in rows):
+        hidden.add("Audio")
     cols = [
-        ("Serie", "left"), ("lokal", "right"), ("RAW", "right"), ("Bilder", "right"), ("Video", "right"),
+        ("Serie", "left"), ("lokal", "right"), ("RAW", "right"), ("Bilder", "right"), ("Video", "right"), ("Audio", "right"),
         ("Stand", "left"), ("Ver.", "right"), ("offen", "right"), ("HDD", "left"), ("S3", "center"), ("ausdünnbar", "right"),
     ]
     t = Table(show_lines=False, header_style="bold", box=box.SIMPLE_HEAD if compact else box.HEAVY_HEAD, pad_edge=not compact)
@@ -138,6 +142,7 @@ def render_status(app: App, rows: list[SeriesStatus]) -> None:
             human(_cls_bytes(st, "raw")) if "raw" in st.by_class else "",
             human(_cls_bytes(st, "img-derived", "img-original")),
             human(_cls_bytes(st, "video")) if "video" in st.by_class else "",
+            human(_cls_bytes(st, "audio")) if "audio" in st.by_class else "",
             STATE_LABEL.get(st.state, st.state),
             str(st.versions or ""),
             human(st.pending_bytes) if st.pending_files else "",
@@ -155,7 +160,7 @@ def render_status(app: App, rows: list[SeriesStatus]) -> None:
     add([
         "[bold]Summe", human(tot.local_bytes), human(_cls_bytes(tot, "raw")),
         human(_cls_bytes(tot, "img-derived", "img-original")), human(_cls_bytes(tot, "video")),
-        "", "", human(tot.pending_bytes), "", "", human(tot.slimmable_bytes),
+        human(_cls_bytes(tot, "audio")), "", "", human(tot.pending_bytes), "", "", human(tot.slimmable_bytes),
     ])
     app.console.print(t)
     counts: dict[str, int] = {}

@@ -1,13 +1,13 @@
-"""Bestandsaufnahme von ``source_root`` in den Index."""
+"""Bestandsaufnahme der Quellordner aller Sammlungen in den Index."""
 
 from __future__ import annotations
 
 import fnmatch
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from .classify import classify, is_raw_name, raw_key
+from .classify import classify_for, is_raw_name, raw_key
+from .config import Collection
 from .context import App
 from .db import utcnow
 from .layout import ROOT_SERIES, series_year
@@ -23,15 +23,18 @@ class ScanStats:
     gone: int = 0
     excluded: int = 0
     series: set[str] = field(default_factory=set)
+    collections: list[str] = field(default_factory=list)  # erfasste Sammlungen
+    missing: list[str] = field(default_factory=list)  # Sammlungen, deren Quellordner fehlt
 
 
 @dataclass
 class _Found:
-    rel: str
+    rel: str  # Index-Pfad (mit Sammlung)
     series: str
     name: str
     size: int
     mtime_ns: int
+    profile: str
 
 
 def _excluded(name: str, patterns_lower: list[str]) -> bool:
@@ -39,12 +42,18 @@ def _excluded(name: str, patterns_lower: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(n, p) for p in patterns_lower)
 
 
-def walk_source(app: App) -> tuple[list[_Found], int]:
+def _norm(p) -> str:
+    return os.path.normcase(os.path.abspath(p))
+
+
+def walk_collection(app: App, coll: Collection) -> tuple[list[_Found], int]:
     cfg = app.cfg
-    root = cfg.source_root
-    name_pats = [p.lower() for p in cfg.exclude_names]
-    dir_pats = [p.lower() for p in cfg.exclude_dirs]
-    catalogs = {c.lower() for c in cfg.catalog_files}
+    name_pats = [p.lower() for p in [*cfg.exclude_names, *coll.exclude_names]]
+    dir_pats = [p.lower() for p in [*cfg.exclude_dirs, *coll.exclude_dirs]]
+    catalogs = {c.lower() for c in cfg.catalog_files} if coll.profile == "photo" else set()
+    # Quellordner anderer Sammlungen innerhalb dieses Ordners gehören dorthin, nicht hierher
+    own = _norm(coll.source_root)
+    nested = {_norm(c.source_root) for c in cfg.collections if c.id != coll.id and _norm(c.source_root) != own}
     found: list[_Found] = []
     excluded = 0
 
@@ -60,7 +69,7 @@ def walk_source(app: App) -> tuple[list[_Found], int]:
                 r = f"{rel}/{e.name}" if rel else e.name
                 try:
                     if e.is_dir(follow_symlinks=False):
-                        if _excluded(e.name, dir_pats):
+                        if _excluded(e.name, dir_pats) or _norm(e.path) in nested:
                             excluded += 1
                             continue
                         rec(e.path, r, series or e.name)
@@ -69,24 +78,45 @@ def walk_source(app: App) -> tuple[list[_Found], int]:
                             excluded += 1
                             continue
                         st = e.stat(follow_symlinks=False)
-                        found.append(_Found(r, series or ROOT_SERIES, e.name, st.st_size, st.st_mtime_ns))
+                        found.append(
+                            _Found(
+                                f"{coll.id}/{r}", f"{coll.id}/{series or ROOT_SERIES}", e.name, st.st_size, st.st_mtime_ns,
+                                coll.profile,
+                            )
+                        )
                 except OSError as ex:
                     app.console.print(f"[yellow]Übersprungen: {e.path} ({ex})")
 
-    rec(str(root), "", None)
+    rec(str(coll.source_root), "", None)
     return found, excluded
 
 
-def scan(app: App, do_hash: bool = False) -> ScanStats:
-    db = app.db
-    root = app.cfg.source_root
-    if not root.is_dir():
-        raise FileNotFoundError(f"source_root existiert nicht: {root}")
-    now = utcnow()
-    with app.console.status(f"Durchsuche {root} …"):
-        found, excluded = walk_source(app)
+def scan(app: App, do_hash: bool = False, only: list[str] | None = None) -> ScanStats:
+    """Alle (bzw. die genannten) Sammlungen erfassen.
 
-    stats = ScanStats(excluded=excluded)
+    Fehlt der Quellordner einer Sammlung (z. B. externe Platte nicht angeschlossen), wird sie
+    übersprungen; ihre Dateien bleiben im Index unverändert und gelten nicht als verschwunden.
+    """
+    db = app.db
+    now = utcnow()
+    stats = ScanStats()
+    found: list[_Found] = []
+    for coll in app.cfg.collections:
+        if only and coll.id not in only:
+            continue
+        if not coll.source_root.is_dir():
+            stats.missing.append(coll.id)
+            app.console.print(f"[yellow]Sammlung {coll.id}: Quellordner fehlt ({coll.source_root}) - übersprungen.")
+            continue
+        with app.console.status(f"Durchsuche {coll.source_root} …"):
+            f, ex = walk_collection(app, coll)
+        found += f
+        stats.excluded += ex
+        stats.collections.append(coll.id)
+    if not stats.collections:
+        roots = ", ".join(str(c.source_root) for c in app.cfg.collections if not only or c.id in only)
+        raise FileNotFoundError(f"Kein Quellordner vorhanden: {roots}")
+
     # RAW-Stämme je Serie (inkl. bereits lokal entfernter RAWs aus dem Index)
     raw_keys: dict[str, set[str]] = {}
     for f in found:
@@ -103,7 +133,7 @@ def scan(app: App, do_hash: bool = False) -> ScanStats:
             stats.files += 1
             stats.bytes += f.size
             stats.series.add(f.series)
-            cls = classify(f.name, raw_keys.get(f.series, set()))
+            cls = classify_for(f.profile, f.name, raw_keys.get(f.series, set()))
             old = existing.get(f.rel)
             if old is None:
                 stats.new += 1
@@ -121,11 +151,18 @@ def scan(app: App, do_hash: bool = False) -> ScanStats:
                        last_seen=? WHERE path=?""",
                     (f.series, cls, f.size, f.mtime_ns, old["sha256"] if unchanged else None, now, f.rel),
                 )
-        cur = c.execute("UPDATE files SET present=0 WHERE present=1 AND (last_seen IS NULL OR last_seen<>?)", (now,))
-        stats.gone = cur.rowcount
+        for cid in stats.collections:
+            cur = c.execute(
+                """UPDATE files SET present=0 WHERE present=1 AND (last_seen IS NULL OR last_seen<>?)
+                   AND substr(path, 1, ?)=?""",
+                (now, len(cid) + 1, cid + "/"),
+            )
+            stats.gone += cur.rowcount
         for s in stats.series:
+            coll = app.cfg.collection_of(s)
             c.execute(
-                "INSERT OR IGNORE INTO series(name, year, first_seen) VALUES(?,?,?)", (s, series_year(s), now)
+                "INSERT OR IGNORE INTO series(name, year, first_seen) VALUES(?,?,?)",
+                (s, series_year(s) if coll.year == "name" else None, now),
             )
 
     if do_hash:
@@ -141,14 +178,13 @@ def hash_missing(app: App, series: list[str] | None = None) -> int:
     if series:
         sql += f" AND series IN ({','.join('?' * len(series))})"
         params = list(series)
-    rows = db.q(sql, params)
+    rows = [r for r in db.q(sql, params) if app.cfg.find_collection(r["path"].partition("/")[0])]
     total = sum(r["size"] for r in rows)
-    root = app.cfg.source_root
     n = 0
     with app.byte_progress() as prog:
         task = prog.add_task("Hashen", total=total)
         for r in rows:
-            p = root.joinpath(*r["path"].split("/"))
+            p = app.cfg.source_file(r["path"])
             try:
                 st = p.stat()
                 if st.st_size != r["size"] or st.st_mtime_ns != r["mtime_ns"]:

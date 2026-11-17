@@ -62,7 +62,7 @@ def app(tmp_path: Path, pictures: Path) -> App:
         index_path=tmp_path / "data" / "index.sqlite",
         chunk_size_mb=1,  # kleine Pakete -> mehrere Chunks testbar
         hdd_paths=[str(tmp_path / "hddA"), str(tmp_path / "hddB")],
-        s3=S3Config(bucket="test-bucket", prefix="fotos/", profile="", region="eu-west-1"),
+        s3=S3Config(bucket="test-bucket", prefix="", profile="", region="eu-west-1"),
     )
     cfg.chunk_size_mb = 1
     a = App(cfg=cfg, db=Index(cfg.index_path), console=Console(width=160, force_terminal=False))

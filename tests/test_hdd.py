@@ -13,7 +13,8 @@ from foto_archiv.seal import seal_series
 from foto_archiv.status import compute_status
 from foto_archiv.tario import PARTIAL_SUFFIX
 
-KENIA = "2026.Kenia"
+KENIA = "fotos/2026.Kenia"  # Serie im Index
+KENIA_DIR = "2026.Kenia"  # Ordner im Quellordner / Pfad im Tar
 
 
 # --------------------------------------------------------------------------- Hilfen
@@ -44,6 +45,10 @@ def _files(app):
     return {r["path"]: r for r in app.db.q("SELECT * FROM files")}
 
 
+def _rel(paths):
+    return sorted(p.removeprefix("fotos/") for p in paths)
+
+
 def _raw_paths(app):
     return sorted(p for p, r in _files(app).items() if r["series"] == KENIA and r["cls"] == "raw")
 
@@ -57,7 +62,7 @@ def test_copy_hdd(app, hdd_a, hdd_b):
 
     # Trockenlauf ändert nichts
     copy_hdd(app, hdd_a, hdd_b, None, dry_run=True)
-    assert not (hdd_b.root / "2026").exists()
+    assert not (hdd_b.root / "fotos").exists()
 
     res = copy_hdd(app, hdd_a, hdd_b, None, dry_run=False)
     bundles = app.db.bundles_of(KENIA)
@@ -66,7 +71,7 @@ def test_copy_hdd(app, hdd_a, hdd_b):
         assert hdd_b.path_for(b["relpath"]).read_bytes() == hdd_a.path_for(b["relpath"]).read_bytes()
         row = _copy_row(app, b["id"], hdd_b)
         assert row["status"] == "ok" and row["verified_at"]
-    assert hdd_b.path_for("2026/2026.Kenia/v1/manifest.json.gz").is_file()
+    assert hdd_b.path_for("fotos/2026/2026.Kenia/v1/manifest.json.gz").is_file()
     assert app.db.q1("SELECT 1 FROM manifest_copies WHERE series=? AND volume_id=?", (KENIA, hdd_b.id))
     assert (hdd_b.root / "_kataloge" / "2026-11-12" / "digikam4.db").read_bytes() == b"katalog"
     assert (hdd_b.root / "_index" / "index.sqlite").is_file()
@@ -120,14 +125,14 @@ def test_verify_hdd(app, hdd_a, hdd_b):
     p = hdd_b.path_for(vid["relpath"])
     p.write_bytes(p.read_bytes()[:1000])
     hdd_b.path_for(img["relpath"]).unlink()
-    (hdd_b.root / "2026" / f"x.tar{PARTIAL_SUFFIX}").write_bytes(b"rest")
+    (hdd_b.root / "fotos" / "2026" / f"x.tar{PARTIAL_SUFFIX}").write_bytes(b"rest")
     with pytest.raises(OpFailed) as ei:
         verify_hdd(app, hdd_b, [KENIA], quick=True)
     r = ei.value.result
     assert vid["relpath"] in r.bad and r.missing == [img["relpath"]]
     assert raw["relpath"] in r.unverified  # Status bad bleibt, Größe passt
-    assert r.partials == [f"2026/x.tar{PARTIAL_SUFFIX}"]
-    assert (hdd_b.root / "2026" / f"x.tar{PARTIAL_SUFFIX}").exists()  # verify löscht nichts
+    assert r.partials == [f"fotos/2026/x.tar{PARTIAL_SUFFIX}"]
+    assert (hdd_b.root / "fotos" / "2026" / f"x.tar{PARTIAL_SUFFIX}").exists()  # verify löscht nichts
     assert _copy_row(app, vid["id"], hdd_b)["status"] == "bad"
     assert _copy_row(app, img["id"], hdd_b)["status"] == "missing"
 
@@ -150,10 +155,10 @@ def test_verify_registers_unknown_copy(app, hdd_a, hdd_b):
 
 def test_verify_missing_manifest(app, hdd_a):
     _seal(app, hdd_a)
-    hdd_a.path_for("2026/2026.Kenia/v1/manifest.json.gz").unlink()
+    hdd_a.path_for("fotos/2026/2026.Kenia/v1/manifest.json.gz").unlink()
     with pytest.raises(OpFailed) as ei:
         verify_hdd(app, hdd_a, None, quick=True)
-    assert ei.value.result.manifests_missing == ["2026/2026.Kenia/v1/manifest.json.gz"]
+    assert ei.value.result.manifests_missing == ["fotos/2026/2026.Kenia/v1/manifest.json.gz"]
 
 
 # --------------------------------------------------------------------------- slim
@@ -165,27 +170,27 @@ def test_slim_protection_and_apply(app, hdd_a):
 
     # require_s3=True (Standard) und keine S3-Kopie -> nichts ausdünnbar
     assert slim(app, None, None, apply=True).candidates == 0
-    assert all(root.joinpath(p).exists() for p in raws)
+    assert all(app.cfg.source_file(p).exists() for p in raws)
 
     _add_s3(app)
     prev = slim(app, None, None, apply=False)
     assert prev.candidates == 10 and not prev.deleted
-    assert all(root.joinpath(p).exists() for p in raws)
+    assert all(app.cfg.source_file(p).exists() for p in raws)
 
     # eine Datei nach dem scan verändert -> darf nicht gelöscht werden
-    changed = root / KENIA / "raws" / "DSC05.ARW.pp3"
+    changed = root / KENIA_DIR / "raws" / "DSC05.ARW.pp3"
     os.utime(changed, (1_700_000_000, 1_700_000_000))
-    others = {p: root.joinpath(p).stat().st_mtime_ns for p, r in _files(app).items() if r["cls"] != "raw"}
+    others = {p: app.cfg.source_file(p).stat().st_mtime_ns for p, r in _files(app).items() if r["cls"] != "raw"}
 
     res = slim(app, None, None, apply=True)
     assert len(res.deleted) == 9 and res.skipped == [f"{KENIA}/raws/DSC05.ARW.pp3"]
     assert changed.exists()
-    assert (root / KENIA / "raws").is_dir()  # nicht leer -> bleibt
+    assert (root / KENIA_DIR / "raws").is_dir()  # nicht leer -> bleibt
     for p, mt in others.items():  # JPG, Video usw. unberührt
-        assert root.joinpath(p).stat().st_mtime_ns == mt
+        assert app.cfg.source_file(p).stat().st_mtime_ns == mt
     rows = _files(app)
     for p in res.deleted:
-        assert not root.joinpath(p).exists()
+        assert not app.cfg.source_file(p).exists()
         assert rows[p]["present"] == 0 and rows[p]["slimmed"] == 1
 
     # scan danach: entfernte RAWs bleiben "slimmed", Exporte bleiben img-derived
@@ -209,7 +214,7 @@ def test_slim_requires_hdd_verification(app, hdd_a):
 def test_slim_refuses_without_source_root(app, hdd_a, tmp_path):
     _seal(app, hdd_a)
     _add_s3(app)
-    app.cfg.source_root = tmp_path / "gibt-es-nicht"
+    app.cfg.collections[0].source_root = tmp_path / "gibt-es-nicht"
     with pytest.raises(OpFailed):
         slim(app, None, None, apply=True)
 
@@ -220,16 +225,16 @@ def test_slim_then_restore_raw(app, hdd_a):
     _add_s3(app)
     root = app.cfg.source_root
     raws = _raw_paths(app)
-    original = {p: root.joinpath(p).read_bytes() for p in raws}
+    original = {p: app.cfg.source_file(p).read_bytes() for p in raws}
 
     slim(app, [KENIA], ["raw"], apply=True)
-    assert not (root / KENIA / "raws").exists()  # durch slim leer geworden -> entfernt
-    assert (root / KENIA).is_dir()
+    assert not (root / KENIA_DIR / "raws").exists()  # durch slim leer geworden -> entfernt
+    assert (root / KENIA_DIR).is_dir()
 
     res = restore_hdd(app, KENIA, ["raw"], root, hdd_a, overwrite=False, dry_run=False)
-    assert sorted(res.written) == raws and not res.conflicts and not res.hash_errors
+    assert sorted(res.written) == _rel(raws) and not res.conflicts and not res.hash_errors
     for p, data in original.items():
-        assert root.joinpath(p).read_bytes() == data
+        assert app.cfg.source_file(p).read_bytes() == data
     rows = _files(app)
     for p in raws:
         assert rows[p]["present"] == 1 and rows[p]["slimmed"] == 0
@@ -241,30 +246,30 @@ def test_slim_then_restore_raw(app, hdd_a):
 
     # nochmal: alles identisch
     res2 = restore_hdd(app, KENIA, ["raw"], root, hdd_a, overwrite=False, dry_run=False)
-    assert sorted(res2.skipped_same) == raws and not res2.written
+    assert sorted(res2.skipped_same) == _rel(raws) and not res2.written
 
 
 def test_restore_conflicts(app, hdd_a, tmp_path):
     _seal(app, hdd_a)
     target = tmp_path / "ziel"
-    clash = target / KENIA / "raws" / "DSC01.ARW"
+    clash = target / KENIA_DIR / "raws" / "DSC01.ARW"
     clash.parent.mkdir(parents=True)
     clash.write_bytes(b"anderer Inhalt")
 
     res = restore_hdd(app, KENIA, ["raw"], target, hdd_a, overwrite=False, dry_run=False)
-    assert res.conflicts == [f"{KENIA}/raws/DSC01.ARW"] and len(res.written) == 9
+    assert res.conflicts == [f"{KENIA_DIR}/raws/DSC01.ARW"] and len(res.written) == 9
     assert clash.read_bytes() == b"anderer Inhalt"
 
     res2 = restore_hdd(app, KENIA, ["raw"], target, hdd_a, overwrite=True, dry_run=False)
-    assert res2.written == [f"{KENIA}/raws/DSC01.ARW"] and len(res2.skipped_same) == 9
-    assert clash.read_bytes() == (app.cfg.source_root / KENIA / "raws" / "DSC01.ARW").read_bytes()
+    assert res2.written == [f"{KENIA_DIR}/raws/DSC01.ARW"] and len(res2.skipped_same) == 9
+    assert clash.read_bytes() == (app.cfg.source_root / KENIA_DIR / "raws" / "DSC01.ARW").read_bytes()
     # Ziel != source_root -> Index unverändert
     assert _files(app)[f"{KENIA}/raws/DSC01.ARW"]["present"] == 1
 
 
 def test_restore_latest_version(app, hdd_a, tmp_path):
     _seal(app, hdd_a)
-    root = app.cfg.source_root / KENIA
+    root = app.cfg.source_root / KENIA_DIR
     (root / "jpg" / "DSC02.jpg").write_bytes(b"v2-Inhalt")
     scan(app)
     seal_series(app, KENIA, hdd_a)
@@ -272,9 +277,9 @@ def test_restore_latest_version(app, hdd_a, tmp_path):
     target = tmp_path / "ziel"
     res = restore_hdd(app, KENIA, ["img-derived"], target, hdd_a, overwrite=False, dry_run=False)
     assert len(res.written) == 6 and not res.hash_errors
-    assert (target / KENIA / "jpg" / "DSC02.jpg").read_bytes() == b"v2-Inhalt"
-    assert (target / KENIA / "jpg" / "DSC01.jpg").read_bytes() == (root / "jpg" / "DSC01.jpg").read_bytes()
-    assert not (target / KENIA / "raws").exists()
+    assert (target / KENIA_DIR / "jpg" / "DSC02.jpg").read_bytes() == b"v2-Inhalt"
+    assert (target / KENIA_DIR / "jpg" / "DSC01.jpg").read_bytes() == (root / "jpg" / "DSC01.jpg").read_bytes()
+    assert not (target / KENIA_DIR / "raws").exists()
 
 
 def test_restore_bundle_not_on_volume(app, hdd_a, hdd_b, tmp_path, capsys):

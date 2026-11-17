@@ -18,13 +18,14 @@ import typer
 from rich.table import Table
 
 from .classify import CLASSES
+from .config import ConfigError
 from .context import App, human
 from .db import utcnow
-from .layout import CATALOG_DIR, INDEX_DIR
+from .layout import CATALOG_DIR, INDEX_DIR, split_vpath
 from .policy import bundle_protection, slim_candidates
 from .seal import export_index
 from .tario import BUF, PARTIAL_SUFFIX, extract_bundle, sha256_file
-from .volumes import Volume
+from .volumes import FAT_MAX_FILE, Volume, is_fat
 
 SPACE_MARGIN = 50 * 1024 * 1024  # Reserve für Index-Export u. Ä.
 USAGE_WARN = 0.80
@@ -181,6 +182,12 @@ def copy_hdd(app: App, src: Volume, dst: Volume, series: list[str] | None, dry_r
     bundles = _bundles_to_copy(app, src, dst, series)
     manifests = _manifests_to_copy(app, src, dst, series)
     catalogs = _catalogs_to_copy(src, dst)
+
+    too_big = [b for b in bundles if b["size"] > FAT_MAX_FILE]
+    if too_big and is_fat(fs := dst.filesystem()):
+        for b in too_big:
+            res.errors.append(f"{b['relpath']}: {human(b['size'])} passt nicht auf {dst.label} ({fs}, max. 4 GiB je Datei)")
+        bundles = [b for b in bundles if b["size"] <= FAT_MAX_FILE]
 
     # Platzbedarf: Pakete, die nicht schon in passender Größe auf dem Ziel liegen
     def already_there(b) -> bool:
@@ -507,14 +514,22 @@ def slim(app: App, series: list[str] | None, classes: list[str] | None, apply: b
     """
     con, db, cfg = app.console, app.db, app.cfg
     res = SlimResult()
-    root = cfg.source_root
-    if not root.is_dir():
-        con.print(f"[red]Foto-Ordner existiert nicht:[/] {root} – Abbruch.")
-        raise OpFailed(res)
     _check_classes(app, classes)
     classes = classes or cfg.slim.classes
 
     cands = slim_candidates(app, series, classes)
+    # Quellordner der betroffenen Sammlungen müssen vorhanden (und bekannt) sein
+    roots: dict[str, Path] = {}
+    for cid in sorted({split_vpath(c.path)[0] for c in cands}):
+        try:
+            root = cfg.collection(cid).source_root
+        except ConfigError as e:
+            con.print(f"[red]{e}[/] – Abbruch.")
+            raise OpFailed(res) from None
+        if not root.is_dir():
+            con.print(f"[red]Quellordner der Sammlung {cid} existiert nicht:[/] {root} – Abbruch.")
+            raise OpFailed(res)
+        roots[cid] = root
     res.candidates = len(cands)
     _render_slim_preview(app, cands, series, classes)
     if not cands or not apply:
@@ -522,11 +537,12 @@ def slim(app: App, series: list[str] | None, classes: list[str] | None, apply: b
             con.print("Vorschau – zum Löschen [bold]--apply[/] angeben.")
         return res
 
-    root_res = root.resolve()
-    touched_dirs: set[Path] = set()
+    resolved = {cid: r.resolve() for cid, r in roots.items()}
+    touched_dirs: dict[str, set[Path]] = {}
     for c in cands:
-        p = root.joinpath(*c.path.split("/"))
-        reason = _unsafe_reason(db, c, p, root_res)
+        cid, rel = split_vpath(c.path)
+        p = roots[cid].joinpath(*rel.split("/"))
+        reason = _unsafe_reason(db, c, p, resolved[cid])
         if reason:
             res.skipped.append(c.path)
             con.print(f"[yellow]Übersprungen:[/] {c.path} ({reason})")
@@ -539,9 +555,10 @@ def slim(app: App, series: list[str] | None, classes: list[str] | None, apply: b
         db.x("UPDATE files SET present=0, slimmed=1 WHERE path=?", (c.path,))
         res.deleted.append(c.path)
         res.bytes_freed += c.size
-        touched_dirs.add(p.parent)
+        touched_dirs.setdefault(cid, set()).add(p.parent)
 
-    res.dirs_removed = _remove_empty_dirs(root, touched_dirs)
+    for cid, dirs in touched_dirs.items():
+        res.dirs_removed += [f"{cid}/{d}" for d in _remove_empty_dirs(roots[cid], dirs)]
     con.print(
         f"[green]✓ {len(res.deleted)} Datei(en) entfernt, {human(res.bytes_freed)} frei geworden[/]"
         + (f", {len(res.dirs_removed)} leere(r) Ordner entfernt" if res.dirs_removed else "")
@@ -562,7 +579,7 @@ def _unsafe_reason(db, c, p: Path, root_res: Path) -> str | None:
     except OSError as e:
         return f"Pfad nicht auflösbar: {e}"
     if rp == root_res or not rp.is_relative_to(root_res):
-        return "liegt außerhalb des Foto-Ordners"
+        return "liegt außerhalb des Quellordners"
     if p.is_symlink() or not p.is_file():
         return "keine reguläre Datei"
     row = db.q1("SELECT size, mtime_ns, sha256, present FROM files WHERE path=?", (c.path,))
@@ -657,15 +674,23 @@ class RestoreResult:
 
 
 def restore_hdd(
-    app: App, series: str, classes: list[str] | None, target: Path, volume: Volume, overwrite: bool, dry_run: bool
+    app: App, series: str, classes: list[str] | None, target: Path | None, volume: Volume, overwrite: bool, dry_run: bool
 ) -> RestoreResult:
     """Serie (optional nur bestimmte Klassen) von einem HDD-Volume nach ``target`` entpacken.
 
-    Je Pfad wird nur der Stand der jüngsten Version wiederhergestellt.
+    ``target`` None = Quellordner der Sammlung. Je Pfad wird nur der Stand der jüngsten Version
+    wiederhergestellt. Die Pfade im Ergebnis sind relativ zu ``target`` (wie im Tar).
     """
     con, db, cfg = app.console, app.db, app.cfg
     res = RestoreResult()
     _check_classes(app, classes)
+    cid = split_vpath(series)[0]
+    try:
+        coll_root = cfg.collection(cid).source_root
+    except ConfigError as e:
+        con.print(f"[red]{e}")
+        raise OpFailed(res) from None
+    target = Path(target) if target is not None else coll_root
 
     latest = db.latest_archived(series)
     if classes:
@@ -675,10 +700,10 @@ def restore_hdd(
         con.print(f"[red]Für '{series}'{what} ist nichts archiviert.")
         raise OpFailed(res)
 
-    # Pfade je Paket (jeweils jüngste Version)
+    # Pfade je Paket (jeweils jüngste Version), als Namen im Tar
     wanted: dict[int, dict[str, str]] = {}
     for path, a in latest.items():
-        wanted.setdefault(a["bundle_id"], {})[path] = a["sha256"]
+        wanted.setdefault(a["bundle_id"], {})[split_vpath(path)[1]] = a["sha256"]
     bundles = db.q(
         f"SELECT * FROM bundles WHERE id IN ({_in_clause(wanted)}) ORDER BY version, name", list(wanted)
     )
@@ -716,7 +741,7 @@ def restore_hdd(
         )
 
     target.mkdir(parents=True, exist_ok=True)
-    to_source = target.resolve() == cfg.source_root.resolve()
+    to_source = target.resolve() == coll_root.resolve()
     done = 0
     with app.byte_progress() as prog:
         task = prog.add_task(f"{series}", total=sum(b["size"] for b in available))
@@ -740,7 +765,7 @@ def restore_hdd(
             res.hash_errors += st.hash_errors
             res.bytes_written += st.bytes_written
             if to_source:
-                _update_files_rows(app, target, st.written + st.skipped_same, latest)
+                _update_files_rows(app, target, cid, st.written + st.skipped_same, latest)
 
     _render_restore(app, series, target, res)
     if res.failed:
@@ -748,14 +773,18 @@ def restore_hdd(
     return res
 
 
-def _update_files_rows(app: App, root: Path, paths: list[str], latest: dict) -> None:
-    """Index-Zeilen wiederhergestellter Dateien aktualisieren, damit ``scan`` sie als unverändert sieht."""
+def _update_files_rows(app: App, root: Path, cid: str, paths: list[str], latest: dict) -> None:
+    """Index-Zeilen wiederhergestellter Dateien aktualisieren, damit ``scan`` sie als unverändert sieht.
+
+    ``paths``: Namen im Tar (relativ zum Quellordner der Sammlung ``cid``).
+    """
     now = utcnow()
     with app.db.tx() as c:
-        for path in paths:
-            a = latest[path]
+        for rel in paths:
+            vpath = f"{cid}/{rel}"
+            a = latest[vpath]
             try:
-                st = root.joinpath(*path.split("/")).stat()
+                st = root.joinpath(*rel.split("/")).stat()
             except OSError:
                 continue
             c.execute(
@@ -763,7 +792,7 @@ def _update_files_rows(app: App, root: Path, paths: list[str], latest: dict) -> 
                    VALUES(?,?,?,?,?,?,1,0,?)
                    ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
                        sha256=excluded.sha256, present=1, slimmed=0, last_seen=excluded.last_seen""",
-                (path, a["series"], a["cls"], st.st_size, st.st_mtime_ns, a["sha256"], now),
+                (vpath, a["series"], a["cls"], st.st_size, st.st_mtime_ns, a["sha256"], now),
             )
 
 

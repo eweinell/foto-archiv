@@ -9,11 +9,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .classify import CLASSES
+from .config import Collection, ConfigError
 from .context import App, human
 from .db import utcnow
-from .layout import INDEX_DIR, bundle_name, bundle_relpath, manifest_relpath, series_year
+from .layout import (
+    INDEX_DIR,
+    README_NAME,
+    bundle_name,
+    bundle_relpath,
+    collection_year,
+    manifest_relpath,
+    series_name,
+    split_vpath,
+)
 from .tario import PARTIAL_SUFFIX, TarEntry, sha256_file, write_tar
-from .volumes import Volume
+from .volumes import FAT_MAX_FILE, Volume, is_fat
 
 TAR_OVERHEAD_PER_FILE = 3 * 512  # Header + PAX-Header + Padding (Schätzung)
 TAR_OVERHEAD_FIXED = 20 * 512
@@ -36,11 +46,20 @@ class SealPlan:
     series: str
     version: int
     items: list[PlanItem]
+    collection: Collection
     chunks: dict[str, list[list[PlanItem]]] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
         return sum(i.size for i in self.items)
+
+    def chunk_sizes(self) -> list[int]:
+        """Geschätzte Größe jedes Pakets (Bytes)."""
+        return [
+            TAR_OVERHEAD_FIXED + sum(i.size + TAR_OVERHEAD_PER_FILE for i in c)
+            for chunks in self.chunks.values()
+            for c in chunks
+        ]
 
     def by_class(self) -> dict[str, tuple[int, int]]:
         out: dict[str, tuple[int, int]] = {}
@@ -69,11 +88,17 @@ def _chunk(items: list[PlanItem], limit: int) -> list[list[PlanItem]]:
 def plan_seal(app: App, series: str) -> SealPlan | None:
     """Ermittelt, was in die nächste Version einer Serie gehört (None = nichts zu tun)."""
     db = app.db
+    cid, name = split_vpath(series)
+    try:
+        coll = app.cfg.collection(cid)
+    except ConfigError as e:
+        raise SealError(f"Serie '{series}': {e}") from None
+    if not name:
+        raise SealError(f"Serie '{series}': Serienname fehlt.")
     archived = db.latest_archived(series)
     rows = db.q("SELECT * FROM files WHERE series=? AND present=1 ORDER BY path", (series,))
     if not rows and not archived:
         raise SealError(f"Serie '{series}' ist unbekannt (erst 'scan' ausführen).")
-    root = app.cfg.source_root
     items: list[PlanItem] = []
     for r in rows:
         a = archived.get(r["path"])
@@ -84,29 +109,34 @@ def plan_seal(app: App, series: str) -> SealPlan | None:
                     sha = "changed"
                 else:
                     # unbekannter Stand: hashen und mit Archiv vergleichen
-                    sha = sha256_file(root.joinpath(*r["path"].split("/")))
+                    sha = sha256_file(app.cfg.source_file(r["path"]))
                     db.x("UPDATE files SET sha256=? WHERE path=? AND mtime_ns=?", (sha, r["path"], r["mtime_ns"]))
             if sha == a["sha256"]:
                 continue
         items.append(PlanItem(r["path"], r["cls"], r["size"], r["mtime_ns"]))
     if not items:
         return None
-    plan = SealPlan(series=series, version=db.next_version(series), items=items)
+    plan = SealPlan(series=series, version=db.next_version(series), items=items, collection=coll)
     limit = app.cfg.chunk_size_bytes
-    for cls in CLASSES:
+    order = list(CLASSES) + sorted({i.cls for i in items} - set(CLASSES))
+    for cls in order:
         cls_items = [i for i in items if i.cls == cls]
         if cls_items:
             plan.chunks[cls] = _chunk(cls_items, limit)
     return plan
 
 
-def _manifest(series: str, version: int, sealed_at: str, bundles: list[dict], files: list[dict], removed: list[str]) -> bytes:
+def _manifest(
+    coll: Collection, series: str, version: int, sealed_at: str, bundles: list[dict], files: list[dict], removed: list[str]
+) -> bytes:
     doc = {
-        "format": "foto-archiv/manifest@1",
-        "series": series,
-        "year": series_year(series),
+        "format": "foto-archiv/manifest@2",
+        "collection": coll.id,
+        "series": series_name(series),
+        "year": collection_year(coll, series),
         "version": version,
         "sealed_at": sealed_at,
+        "paths": "relativ zum Quellordner der Sammlung (wie im Tar)",
         "bundles": bundles,
         "files": files,
         "removed_since_previous": removed,
@@ -133,11 +163,20 @@ def seal_series(app: App, series: str, volume: Volume, verify: bool = True, dry_
     free = volume.free_bytes()
     if free < need:
         raise SealError(f"Zu wenig Platz auf {volume}: frei {human(free)}, benötigt {human(need)}")
-    if any(len(c) == 1 and c[0].size > 4 * 1024**3 - 64 * 1024 for chunks in plan.chunks.values() for c in chunks):
-        con.print("[yellow]Hinweis: Einzeldatei > 4 GiB - Paket ist nicht FAT32-tauglich.")
+    biggest = max(plan.chunk_sizes(), default=0)
+    if biggest > FAT_MAX_FILE:
+        fs = volume.filesystem()
+        if is_fat(fs):
+            raise SealError(
+                f"{volume.label} ist mit {fs} formatiert (max. 4 GiB je Datei), ein Paket wird {human(biggest)} groß "
+                "(Einzeldatei > 4 GiB). Archivplatte mit NTFS oder exFAT verwenden."
+            )
+        if fs is None:
+            con.print("[yellow]Hinweis: Paket > 4 GiB - auf FAT32-Laufwerken nicht speicherbar.")
 
-    root = app.cfg.source_root
-    vdir_rel = manifest_relpath(series, plan.version).rsplit("/", 1)[0]
+    coll = plan.collection
+    cid = coll.id
+    vdir_rel = manifest_relpath(coll, series, plan.version).rsplit("/", 1)[0]
     vdir = volume.path_for(vdir_rel)
     vdir.mkdir(parents=True, exist_ok=True)
     for stale in vdir.glob(f"*{PARTIAL_SUFFIX}"):
@@ -152,9 +191,10 @@ def seal_series(app: App, series: str, volume: Volume, verify: bool = True, dry_
         for cls, chunks in plan.chunks.items():
             for idx, chunk in enumerate(chunks, start=1):
                 name = bundle_name(cls, idx)
-                rel = bundle_relpath(series, plan.version, name)
+                rel = bundle_relpath(coll, series, plan.version, name)
                 out = volume.path_for(rel)
-                entries = [TarEntry(i.path, root.joinpath(*i.path.split("/"))) for i in chunk]
+                # Name im Tar: relativ zum Quellordner der Sammlung
+                entries = [TarEntry(split_vpath(i.path)[1], app.cfg.source_file(i.path)) for i in chunk]
                 prog.update(task, description=f"{series} {name}")
                 res = write_tar(out, entries, lambda d: prog.advance(task, d))
                 if verify:
@@ -172,8 +212,8 @@ def seal_series(app: App, series: str, volume: Volume, verify: bool = True, dry_
     archived = db.latest_archived(series)
     present = {r["path"] for r in db.q("SELECT path FROM files WHERE series=? AND (present=1 OR slimmed=1)", (series,))}
     removed = sorted(p for p in archived if p not in present)
-    mbytes = _manifest(series, plan.version, sealed_at, bundle_docs, file_docs, removed)
-    mrel = manifest_relpath(series, plan.version)
+    mbytes = _manifest(coll, series, plan.version, sealed_at, bundle_docs, file_docs, [split_vpath(p)[1] for p in removed])
+    mrel = manifest_relpath(coll, series, plan.version)
     mpath = volume.path_for(mrel)
     tmp = mpath.with_name(mpath.name + PARTIAL_SUFFIX)
     tmp.write_bytes(mbytes)
@@ -197,13 +237,14 @@ def seal_series(app: App, series: str, volume: Volume, verify: bool = True, dry_
                 (bid, volume.id, now, now if verify else None),
             )
             for pf in files:
+                vpath = f"{cid}/{pf.path}"
                 c.execute(
                     "INSERT INTO archived(path, version, series, cls, size, mtime_ns, sha256, bundle_id) VALUES(?,?,?,?,?,?,?,?)",
-                    (pf.path, plan.version, series, bdoc["class"], pf.size, pf.mtime_ns, pf.sha256, bid),
+                    (vpath, plan.version, series, bdoc["class"], pf.size, pf.mtime_ns, pf.sha256, bid),
                 )
                 c.execute(
                     "UPDATE files SET sha256=? WHERE path=? AND size=? AND mtime_ns=?",
-                    (pf.sha256, pf.path, pf.size, pf.mtime_ns),
+                    (pf.sha256, vpath, pf.size, pf.mtime_ns),
                 )
         c.execute(
             "INSERT OR REPLACE INTO manifest_copies(series, version, volume_id, stored_at) VALUES(?,?,?,?)",
@@ -214,7 +255,49 @@ def seal_series(app: App, series: str, volume: Volume, verify: bool = True, dry_
 
 
 def export_index(app: App, volume: Volume) -> Path:
-    """Legt eine Kopie des Index auf dem Volume ab (macht es selbstbeschreibend)."""
+    """Legt eine Kopie des Index und eine Beschreibung (LIESMICH.txt) auf dem Volume ab."""
     dest = volume.path_for(f"{INDEX_DIR}/index.sqlite")
     app.db.backup_to(dest)
+    try:
+        readme = volume.path_for(README_NAME)
+        tmp = readme.with_name(readme.name + PARTIAL_SUFFIX)
+        tmp.write_text(readme_text(app), encoding="utf-8")
+        tmp.replace(readme)
+    except OSError as e:
+        app.console.print(f"[yellow]{README_NAME} auf {volume.label} nicht geschrieben: {e}")
     return dest
+
+
+def readme_text(app: App) -> str:
+    """Beschreibung der Ablage - Wiederherstellung muss auch ohne das Tool möglich sein."""
+    lines = [
+        "foto-archiv - Archiv-Volume",
+        "===========================",
+        "",
+        "Gleiche Struktur auf jeder Archivplatte und in S3 (dort unter dem konfigurierten Präfix).",
+        "",
+        "Sammlungen (Ordner im Archiv -> Quellordner):",
+    ]
+    known = {c.archive_dir for c in app.cfg.collections}
+    for c in app.cfg.collections:
+        layout = "<Serie>/v<N>/" if c.year == "none" else "<Jahr>/<Serie>/v<N>/ (ohne Jahr: _ohne-jahr/)"
+        lines.append(f"  {c.archive_dir}/  ({c.id}, {c.profile})  {layout}  <- {c.source_root}")
+    for r in app.db.q("SELECT DISTINCT relpath FROM bundles"):
+        top = r["relpath"].split("/", 1)[0]
+        if top not in known:
+            known.add(top)
+            lines.append(f"  {top}/  (früherer Ordnername, ältere Versionen)")
+    lines += [
+        "",
+        "Je Version: manifest.json.gz (welche Datei in welchem Paket, SHA-256) und <Klasse>-<NNN>.tar.",
+        "Pfade im Tar sind relativ zum Quellordner der Sammlung. Wiederherstellen ohne Tool:",
+        "",
+        "  tar -xf <Paket>.tar -C <Quellordner der Sammlung>",
+        "  tar -xf raw-001.tar -C <Quellordner> \"2026.Kenia/raws/DSC01234.ARW\"   (einzelne Datei)",
+        "",
+        "_index/index.sqlite: Gesamtindex (SQLite) - welche Pakete auf welchen Volumes/in S3 liegen.",
+        "_kataloge/: Sicherungen der digiKam-Datenbanken (gzip).",
+        "volume.json: Kennung dieser Platte (nicht löschen).",
+        "",
+    ]
+    return "\n".join(lines)

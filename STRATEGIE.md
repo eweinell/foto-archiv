@@ -71,22 +71,46 @@ Wirkung: Lokal werden bis zu ~230 GB RAW frei, mit Videos bis zu ~260 GB.
 
 Pakete pro Serie lassen sich übers Jahr verteilt versiegeln. Man muss nicht bis zum Jahresende warten oder ein Jahres-Tar neu hochladen. Außerdem lassen sich einzelne Serien und Klassen gezielt wiederherstellen. **Das Jahr bleibt als oberste Ordnerebene erhalten**, so passt die neue Struktur zum bisherigen Aufbau.
 
+### Sammlungen
+
+Neben den Fotos werden weitere Medienordner archiviert, jeweils als **Sammlung** mit eigenem
+Quellordner und eigenem Ordner im Archiv (auf denselben HDDs und im selben Bucket):
+
+| Sammlung | Quelle | Archivordner | Profil | Jahresebene |
+|---|---|---|---|---|
+| `fotos` | `~/Pictures` | `fotos/` | photo (RAW/Export-Abgleich) | ja |
+| `videos` | längere Videos: Diashows, Renderings | `videos/` | media (nur Endung) | ja (Ordner werden noch nach Jahr benannt) |
+| `musik` | Musik | `Musik/` o. ä. | media | **nein** |
+
+Kurze Clips bleiben in ihrer Fotoserie (Klasse `video`). Videos sind kein Schwerpunkt und liegen
+zunächst auf denselben Platten; bei wachsendem Umfang die Kapazität (Abschnitt 6) im Blick behalten.
+Die Sammlung steht als erste Ebene im Index (`fotos/2026.Kenia/…`), der Archivordner ist ein
+eigener Name (`archive_dir`) und kann geändert werden - das gilt dann für neue Versionen, ältere
+Pakete bleiben unter ihrem Ablagepfad (in S3 wird nie umbenannt).
+
 ### Struktur (gleich auf HDD und in S3)
 
 ```
-# in S3 unter dem Präfix fotos/ (neben dem Altbestand fotos/<Jahr>/*.tar)
-<Jahr>/<Serie>/v<N>/manifest.json.gz      # S3: Klasse STANDARD (lesbar ohne Restore)
-<Jahr>/<Serie>/v<N>/raw-001.tar           # S3: DEEP_ARCHIVE
-<Jahr>/<Serie>/v<N>/img-derived-001.tar
-<Jahr>/<Serie>/v<N>/img-original-001.tar
-<Jahr>/<Serie>/v<N>/video-001.tar
-<Jahr>/<Serie>/v<N>/other-001.tar
-_kataloge/<Datum>/digikam4.db, recognition.db   # S3: STANDARD
-_index/index-<UTC-Zeit>.sqlite.gz                # Index-Schnappschuss je push-s3, S3: STANDARD
-                                                 # (HDD: _index/index.sqlite)
+# in S3 unter der Archivwurzel (Bucket-Wurzel), auf der HDD unter <Laufwerk>/foto-archiv/
+fotos/<Jahr>/<Serie>/v<N>/manifest.json.gz      # S3: Klasse STANDARD (lesbar ohne Restore)
+fotos/<Jahr>/<Serie>/v<N>/raw-001.tar           # S3: DEEP_ARCHIVE
+fotos/<Jahr>/<Serie>/v<N>/img-derived-001.tar
+fotos/<Jahr>/<Serie>/v<N>/img-original-001.tar
+fotos/<Jahr>/<Serie>/v<N>/video-001.tar
+fotos/<Jahr>/<Serie>/v<N>/other-001.tar
+fotos/<Jahr>/*.tar                              # Altbestand (unverändert)
+videos/<Jahr>/<Serie>/v<N>/video-001.tar
+Musik/<Serie>/v<N>/audio-001.tar                # Sammlung ohne Jahresebene
+_kataloge/<Datum>/digikam4.db, recognition.db   # S3: STANDARD (ältere unter fotos/_kataloge/)
+_index/index-<UTC-Zeit>.sqlite.gz               # Index-Schnappschuss je push-s3, S3: STANDARD
+                                                # (HDD: _index/index.sqlite, dazu LIESMICH.txt)
 ```
 
+- Die S3-Keys der bis 11/2026 versiegelten Pakete (`fotos/<Jahr>/…`) entsprechen bereits dieser Struktur;
+  bei der Umstellung (`foto-archiv migrate`) wurde nur der Präfix `fotos/` zum Archivordner der Sammlung `fotos`.
 - Jahr: aus dem Präfix des Ordnernamens. Ohne Präfix (`sortiert`, `Camera` …) liegt die Serie unter `_ohne-jahr/`.
+- Tar-Pfade sind relativ zum Quellordner der Sammlung.
+- Pakete werden größer als 4 GB, wenn eine einzelne Datei (z. B. ein Video) größer ist; Archivplatten daher NTFS/exFAT.
 - `v1` ist die erste Versiegelung. Spätere Änderungen (neue Exporte, neue `.pp3`) kommen in `v2` usw., und zwar **nur als Nachtrag**. In S3 wird nichts überschrieben oder gelöscht: Das vermeidet die Gebühr für vorzeitiges Löschen (Mindestlaufzeit 180 Tage) und bewahrt den Verlauf.
 
 ### Manifest (je Serie und Version)

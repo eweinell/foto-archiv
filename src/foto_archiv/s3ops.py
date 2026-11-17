@@ -37,8 +37,9 @@ from rich.table import Table
 from . import s3client
 from .context import App, human
 from .ratelimit import RateError, RateLimiter, Schedule, format_rate, parse_rate, throttled
+from .config import ConfigError
 from .db import utcnow
-from .layout import CATALOG_DIR, INDEX_DIR, series_year
+from .layout import CATALOG_DIR, INDEX_DIR, series_name, series_year, split_vpath
 from .tario import BUF, PARTIAL_SUFFIX, extract_bundle, sha256_file
 from .volumes import Volume, find_connected
 
@@ -68,7 +69,8 @@ PART_ATTEMPTS = 4
 RETRY_DELAY = 2.0  # Sekunden, verdoppelt sich je Versuch (Tests setzen 0)
 
 STAGING_SUFFIX = ".foto-archiv-restore"
-TOOL_KEY_RE = re.compile(r"^[^/]+/[^/]+/v\d+/")
+# relativ zum Ordner einer Sammlung: <Jahr>/<Serie>/vN/… bzw. <Serie>/vN/… (year = "none")
+TOOL_KEY_RE = re.compile(r"^(?:[^/]+/)?[^/]+/v\d+/[^/]+$")
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
@@ -882,8 +884,9 @@ def _restore_plan(app: App, series: str, classes: list[str] | None) -> list[_Res
     return items
 
 
-def _target_path(target: Path, rel: str) -> Path:
-    return target.joinpath(*rel.split("/"))
+def _target_path(target: Path, vpath: str) -> Path:
+    """Zielpfad einer archivierten Datei (Index-Pfad ohne Sammlung, wie im Tar)."""
+    return target.joinpath(*split_vpath(vpath)[1].split("/"))
 
 
 def _local_state(app: App, target: Path, entries, in_source: bool) -> tuple[int, int]:
@@ -906,8 +909,11 @@ def _local_state(app: App, target: Path, entries, in_source: bool) -> tuple[int,
     return missing, differing
 
 
-def _staging_dir(target: Path) -> Path:
-    """Zwischenablage für Pakete neben dem Ziel (nicht darin, damit ``scan`` sie nicht erfasst)."""
+def _staging_dir(target: Path, staging: Path | None = None) -> Path:
+    """Zwischenablage für Pakete: neben dem Ziel (nicht darin, damit ``scan`` sie nicht erfasst)
+    oder in ``staging`` (z. B. externe Platte, wenn lokal der Platz für Paket + Entpacktes fehlt)."""
+    if staging is not None:
+        return Path(staging) / f"foto-archiv{STAGING_SUFFIX}"
     t = target.resolve()
     if t.parent != t:
         return t.parent / f".{t.name}{STAGING_SUFFIX}"
@@ -930,19 +936,30 @@ def _restore_cost(retrieve: int, download: int, tier: str, days: int) -> tuple[f
 
 
 def restore_s3(
-    app: App, series: str, classes: list[str] | None, target: Path, tier: str | None, overwrite: bool, dry_run: bool
+    app: App,
+    series: str,
+    classes: list[str] | None,
+    target: Path | None,
+    tier: str | None,
+    overwrite: bool,
+    dry_run: bool,
+    staging: Path | None = None,
 ) -> None:
     """Serie aus S3 wiederherstellen - idempotent: so oft ausführen, bis alles da ist.
 
     Lauf 1 fordert die Pakete aus Deep Archive an (Restore), spätere Läufe laden bereitstehende
-    Pakete herunter, prüfen sie (SHA-256) und entpacken sie.
+    Pakete herunter, prüfen sie (SHA-256) und entpacken sie. ``target`` None = Quellordner der Sammlung.
     """
     _require_bucket(app)
     db, con, cfg = app.db, app.console, app.cfg
     tier = _norm_tier(app, tier or cfg.s3.restore_tier)
     days = int(cfg.s3.restore_days)
-    target = Path(target)
-    in_source = target.resolve() == cfg.source_root.resolve()
+    try:
+        coll_root = cfg.collection_of(series).source_root
+    except ConfigError as e:
+        _fail(app, str(e))
+    target = Path(target) if target is not None else coll_root
+    in_source = target.resolve() == coll_root.resolve()
 
     items = _restore_plan(app, series, classes)
     if not items:
@@ -1024,7 +1041,7 @@ def restore_s3(
             if db.q1("SELECT 1 FROM restores WHERE key=?", (key,)):
                 db.x("UPDATE restores SET status='available' WHERE key=?", (key,))
             try:
-                ok = _download_and_extract(s3, i, target, overwrite, in_source)
+                ok = _download_and_extract(s3, i, target, overwrite, in_source, staging)
             except KeyboardInterrupt:
                 con.print("\n[yellow]Abgebrochen.[/] Der Download wird beim nächsten Lauf fortgesetzt.")
                 raise typer.Exit(130)
@@ -1156,18 +1173,31 @@ def _cleanup_empty_dirs(path: Path, stop: Path) -> None:
         p = p.parent
 
 
-def _download_and_extract(s3: S3, item: _RestoreItem, target: Path, overwrite: bool, in_source: bool) -> bool:
+def _download_and_extract(
+    s3: S3, item: _RestoreItem, target: Path, overwrite: bool, in_source: bool, staging_base: Path | None = None
+) -> bool:
     app, con = s3.app, s3.app.console
     b = item.bundle
-    staging = _staging_dir(target)
+    staging = _staging_dir(target, staging_base)
     staged = staging.joinpath(*b["relpath"].split("/"))
     staged.parent.mkdir(parents=True, exist_ok=True)
 
     have = staged.exists() and staged.stat().st_size == b["size"]
-    need_space = (0 if have else b["size"]) + sum(a["size"] for a in item.entries)
-    free = shutil.disk_usage(staged.parent).free
-    if free < need_space:
-        raise UploadError(f"Zu wenig Platz: frei {human(free)}, benötigt {human(need_space)}")
+    need_bundle = 0 if have else b["size"]
+    need_files = sum(a["size"] for a in item.entries)
+    target.mkdir(parents=True, exist_ok=True)
+    if os.stat(staged.parent).st_dev == os.stat(target).st_dev:  # gleiches Laufwerk: beides zusammen
+        free = shutil.disk_usage(staged.parent).free
+        if free < need_bundle + need_files:
+            raise UploadError(
+                f"Zu wenig Platz: frei {human(free)}, benötigt {human(need_bundle + need_files)} "
+                "(Paket + entpackte Dateien; Zwischenablage auf anderer Platte mit --staging)"
+            )
+    else:
+        for where, need in ((staged.parent, need_bundle), (target, need_files)):
+            free = shutil.disk_usage(where).free
+            if free < need:
+                raise UploadError(f"Zu wenig Platz in {where}: frei {human(free)}, benötigt {human(need)}")
 
     with app.byte_progress() as prog:
         if not have:
@@ -1178,8 +1208,8 @@ def _download_and_extract(s3: S3, item: _RestoreItem, target: Path, overwrite: b
         if sha != b["sha256"]:
             staged.unlink()
             raise UploadError(f"{b['relpath']}: SHA-256 des heruntergeladenen Pakets falsch - verworfen.")
-        only = {a["path"] for a in item.entries}
-        expected = {a["path"]: a["sha256"] for a in item.entries}
+        only = {split_vpath(a["path"])[1] for a in item.entries}
+        expected = {split_vpath(a["path"])[1]: a["sha256"] for a in item.entries}
         t3 = prog.add_task(f"entpacken {b['name']}", total=sum(a["size"] for a in item.entries))
         stats = extract_bundle(staged, target, expected=expected, only=only, overwrite=overwrite, progress=lambda n: prog.advance(t3, n))
 
@@ -1197,16 +1227,19 @@ def _download_and_extract(s3: S3, item: _RestoreItem, target: Path, overwrite: b
 
 
 def _update_files(app: App, target: Path, item: _RestoreItem, paths: list[str]) -> None:
-    """Wiederhergestellte Dateien im Index als vorhanden (mit bekanntem SHA-256) führen."""
-    by_path = {a["path"]: a for a in item.entries}
+    """Wiederhergestellte Dateien im Index als vorhanden (mit bekanntem SHA-256) führen.
+
+    ``paths``: Namen im Tar (relativ zum Quellordner der Sammlung).
+    """
+    by_rel = {split_vpath(a["path"])[1]: a for a in item.entries}
     now = utcnow()
     with app.db.tx() as c:
-        for p in paths:
-            a = by_path.get(p)
+        for rel in paths:
+            a = by_rel.get(rel)
             if a is None:
                 continue
             try:
-                st = _target_path(target, p).stat()
+                st = _target_path(target, a["path"]).stat()
             except OSError:
                 continue
             c.execute(
@@ -1214,7 +1247,7 @@ def _update_files(app: App, target: Path, item: _RestoreItem, paths: list[str]) 
                    VALUES(?,?,?,?,?,?,1,0,?)
                    ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
                        sha256=excluded.sha256, present=1, slimmed=0, last_seen=excluded.last_seen""",
-                (p, a["series"], a["cls"], st.st_size, st.st_mtime_ns, a["sha256"], now),
+                (a["path"], a["series"], a["cls"], st.st_size, st.st_mtime_ns, a["sha256"], now),
             )
 
 
@@ -1222,30 +1255,47 @@ def _update_files(app: App, target: Path, item: _RestoreItem, paths: list[str]) 
 
 
 def is_tool_key(rel: str) -> bool:
+    """Vom Tool erzeugtes Objekt? ``rel`` relativ zum Ordner einer Sammlung (bzw. zur Archivwurzel)."""
     return bool(TOOL_KEY_RE.match(rel)) or rel.startswith(f"{INDEX_DIR}/") or rel.startswith(f"{CATALOG_DIR}/")
 
 
 _ARCHIVE_EXT = re.compile(r"\.(tar|tar\.gz|tgz|zip|7z)$", re.IGNORECASE)
 
 
+def _archive_dirs(app: App) -> dict[str, str]:
+    """Ordner im Archiv -> Sammlung: konfigurierte und frühere (aus den Paketpfaden)."""
+    dirs = {c.archive_dir: c.id for c in app.cfg.collections}
+    for r in app.db.q("SELECT relpath, series FROM bundles GROUP BY substr(relpath, 1, instr(relpath, '/'))"):
+        dirs.setdefault(r["relpath"].split("/", 1)[0], split_vpath(r["series"])[0])
+    return dirs
+
+
 def legacy_scan(app: App) -> None:
-    """Nicht vom Tool erzeugte Objekte unter dem Präfix in die Tabelle ``legacy`` übernehmen und auflisten."""
+    """Nicht vom Tool erzeugte Objekte in den Ordnern der Sammlungen in die Tabelle ``legacy`` übernehmen.
+
+    Andere Inhalte des Buckets (außerhalb von ``<prefix><archive_dir>/``) werden nicht betrachtet.
+    """
     s3 = _connect(app)
     db, con = app.db, app.console
     now = utcnow()
     legacy: list[dict] = []
+    owner: dict[str, str] = {}  # Key -> Sammlung
     tool_n = tool_bytes = 0
+    dirs = _archive_dirs(app)
     with con.status("Liste Objekte im Bucket …"):
-        for page in s3.client.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket, Prefix=s3.prefix):
-            for o in page.get("Contents", []) or []:
-                rel = o["Key"][len(s3.prefix):]
-                if not rel or (rel.endswith("/") and o["Size"] == 0):
-                    continue  # "Ordner"-Platzhalter
-                if is_tool_key(rel):
-                    tool_n += 1
-                    tool_bytes += o["Size"]
-                else:
-                    legacy.append(o)
+        for adir, cid in dirs.items():
+            base = f"{s3.prefix}{adir}/"
+            for page in s3.client.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket, Prefix=base):
+                for o in page.get("Contents", []) or []:
+                    rel = o["Key"][len(base):]
+                    if not rel or (rel.endswith("/") and o["Size"] == 0):
+                        continue  # "Ordner"-Platzhalter
+                    if is_tool_key(rel):
+                        tool_n += 1
+                        tool_bytes += o["Size"]
+                    else:
+                        legacy.append(o)
+                        owner[o["Key"]] = cid
 
     with db.tx() as c:
         for o in legacy:
@@ -1257,7 +1307,12 @@ def legacy_scan(app: App) -> None:
                 (o["Key"], o["Size"], lm.isoformat() if lm else None, o.get("StorageClass") or "STANDARD",
                  str(o.get("ETag", "")).strip('"'), now),
             )
-    stale = db.q1("SELECT COUNT(*) n FROM legacy WHERE listed_at<>?", (now,))["n"]
+    listed = set(owner)
+    stale = sum(
+        1
+        for r in db.q("SELECT key FROM legacy")
+        if r["key"] not in listed and any(r["key"].startswith(f"{s3.prefix}{d}/") for d in dirs)
+    )
 
     # lokale Serien (inkl. ausgedünnter Dateien) zum Abgleich
     local: dict[str, int] = {
@@ -1266,32 +1321,38 @@ def legacy_scan(app: App) -> None:
     }
     for r in db.q("SELECT series, SUM(size) s FROM versions GROUP BY series"):
         local.setdefault(r["series"], r["s"])
-    by_lower = {s.lower(): s for s in local}
     by_year: dict[int, list[str]] = {}
     for s in local:
         y = series_year(s)
         if y:
             by_year.setdefault(y, []).append(s)
 
-    def match(rel: str) -> str:
-        name = rel.rsplit("/", 1)[-1]
+    def match(key: str, rel_in: str) -> str:
+        cid = owner.get(key, "")
+        mine = [s for s in local if split_vpath(s)[0] == cid]
+        by_lower = {series_name(s).lower(): s for s in mine}
+        name = rel_in.rsplit("/", 1)[-1]
         stem = _ARCHIVE_EXT.sub("", name)
         if stem.lower() in by_lower:
             s = by_lower[stem.lower()]
             return f"Serie {s} (lokal {human(local[s])})"
-        cands = [s for s in local if stem.lower().startswith(s.lower()) or s.lower().startswith(stem.lower())]
+        cands = [
+            s for s in mine
+            if stem.lower().startswith(series_name(s).lower()) or series_name(s).lower().startswith(stem.lower())
+        ]
         if cands and len(stem) >= 4:
             return ", ".join(f"{s} ({human(local[s])})" for s in sorted(cands)[:3])
-        year = series_year(rel.split("/", 1)[0]) or series_year(stem)
-        if year and year in by_year:
-            ss = by_year[year]
+        year = series_year(rel_in.split("/", 1)[0]) or series_year(stem)
+        ss = [s for s in by_year.get(year, []) if s in mine] if year else []
+        if ss:
             return f"Jahr {year}: {len(ss)} lokale Serie(n), {human(sum(local[s] for s in ss))}"
         return ""
 
     groups: dict[str, list[dict]] = {}
     for o in legacy:
-        rel = o["Key"][len(s3.prefix):]
-        folder = rel.split("/", 1)[0] if "/" in rel else "(ohne Ordner)"
+        rel = o["Key"][len(s3.prefix):]  # <archive_dir>/<…>
+        adir, _, rel_in = rel.partition("/")
+        folder = f"{adir}/{rel_in.split('/', 1)[0]}" if "/" in rel_in else f"{adir}/(ohne Ordner)"
         groups.setdefault(folder, []).append(o)
 
     t = Table("Objekt", "Größe", "Klasse", "Datum", "mögliche lokale Entsprechung", header_style="bold")
@@ -1299,7 +1360,10 @@ def legacy_scan(app: App) -> None:
         for o in sorted(groups[folder], key=lambda x: x["Key"]):
             rel = o["Key"][len(s3.prefix):]
             lm = o.get("LastModified")
-            t.add_row(rel, human(o["Size"]), o.get("StorageClass") or "STANDARD", lm.strftime("%Y-%m-%d") if lm else "", match(rel))
+            t.add_row(
+                rel, human(o["Size"]), o.get("StorageClass") or "STANDARD", lm.strftime("%Y-%m-%d") if lm else "",
+                match(o["Key"], rel.partition("/")[2]),
+            )
     con.print(t)
 
     yt = Table("Ordner", "Objekte", "Größe", "Klassen", "lokale Serien dieses Jahres", header_style="bold")
@@ -1310,10 +1374,11 @@ def legacy_scan(app: App) -> None:
         classes = sorted({o.get("StorageClass") or "STANDARD" for o in objs})
         for o in objs:
             monthly += _gb(o["Size"]) * PRICE_STORAGE_GB_MONTH.get(o.get("StorageClass") or "STANDARD", 0.023)
-        y = series_year(folder)
+        cid = owner.get(objs[0]["Key"], "")
+        y = series_year(folder.split("/", 1)[1])
         loc = ""
-        if y and y in by_year:
-            ss = by_year[y]
+        ss = [s for s in by_year.get(y, []) if split_vpath(s)[0] == cid] if y else []
+        if ss:
             loc = f"{len(ss)} Serie(n), {human(sum(local[s] for s in ss))}"
         yt.add_row(folder, str(len(objs)), human(size), ", ".join(classes), loc)
     yt.add_section()
@@ -1366,9 +1431,12 @@ def catalog_backup(app: App, volume: Volume | None, to_s3: bool) -> None:
     stamp = _stamp()
     taken_at = utcnow()
     errors = saved = 0
+    cat_root = cfg.catalog_root()
+    if cat_root is None:
+        _fail(app, "Keine Sammlung mit profile = \"photo\" - Katalog-Datenbanken werden dort gesucht.")
     with tempfile.TemporaryDirectory(prefix="foto-archiv-katalog-") as td:
         for name in cfg.catalog_files:
-            src = cfg.source_root / name
+            src = cat_root / name
             if not src.is_file():
                 continue
             try:
@@ -1429,6 +1497,6 @@ def catalog_backup(app: App, volume: Volume | None, to_s3: bool) -> None:
                     saved += 1
                     con.print(f"[green]✓[/] {name} → s3://{s3.bucket}/{key} ({human(size)})")
     if saved == 0 and errors == 0:
-        con.print(f"Keine Katalog-Datenbanken in {cfg.source_root} gefunden ({', '.join(cfg.catalog_files)}).")
+        con.print(f"Keine Katalog-Datenbanken in {cat_root} gefunden ({', '.join(cfg.catalog_files)}).")
     if errors:
         raise typer.Exit(1)

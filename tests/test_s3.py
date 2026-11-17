@@ -19,7 +19,7 @@ from foto_archiv.scan import scan
 from foto_archiv.seal import seal_series
 
 BUCKET = "test-bucket"
-PREFIX = "fotos/"
+PREFIX = ""  # Archivwurzel = Bucket-Wurzel; Sammlung "fotos" liegt unter fotos/
 
 
 @pytest.fixture
@@ -78,9 +78,9 @@ def _big_series(app, hdd, size: int = 12 * 1024 * 1024):
     p = app.cfg.source_root / "2025.Gross" / "BIG.ARW"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(os.urandom(size))
-    _sealed(app, hdd, "2025.Gross")
+    _sealed(app, hdd, "fotos/2025.Gross")
     app.cfg.s3.part_size_mb = 5
-    (b,) = app.db.bundles_of("2025.Gross")
+    (b,) = app.db.bundles_of("fotos/2025.Gross")
     assert b["size"] > 10 * 1024 * 1024
     return b
 
@@ -89,7 +89,7 @@ def _big_series(app, hdd, size: int = 12 * 1024 * 1024):
 
 
 def test_push_uploads_bundles_manifest_and_index(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2026.Kenia", "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2026.Kenia", "fotos/2013.Österreich")
     push_s3(app, None, None, dry_run=True)
     assert "Würde hochladen" in capsys.readouterr().out
     assert _keys(s3) == []
@@ -107,9 +107,9 @@ def test_push_uploads_bundles_manifest_and_index(app, hdd_a, s3, capsys):
         c = app.db.q1("SELECT * FROM copies WHERE bundle_id=? AND volume_id=?", (b["id"], vol))
         assert c["status"] == "ok" and c["verified_at"]
     # Umlaut-Serie: Key mit Umlaut, Metadaten ASCII (prozentkodiert)
-    oe = next(b for b in bundles if b["series"] == "2013.Österreich")
+    oe = next(b for b in bundles if b["series"] == "fotos/2013.Österreich")
     h = s3.head_object(Bucket=BUCKET, Key=_key(oe["relpath"]))
-    assert s3client.meta_decode(h["Metadata"]["series"]) == "2013.Österreich"
+    assert s3client.meta_decode(h["Metadata"]["series"]) == "fotos/2013.Österreich"
 
     for v in app.db.q("SELECT * FROM versions"):
         h = s3.head_object(Bucket=BUCKET, Key=_key(v["manifest_relpath"]))
@@ -138,29 +138,29 @@ def test_push_uploads_bundles_manifest_and_index(app, hdd_a, s3, capsys):
 
 def test_push_registers_existing_identical_object(app, hdd_a, s3):
     """Objekt liegt schon (identisch) in S3, Index weiß nichts -> nur nachtragen, nicht neu schreiben."""
-    _sealed(app, hdd_a, "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
     push_s3(app, None, None, dry_run=False)
     app.db.x("DELETE FROM copies WHERE volume_id=?", (app.cfg.s3.volume_id,))
-    versions_before = s3.list_object_versions(Bucket=BUCKET, Prefix=PREFIX + "2013/")["Versions"]
+    versions_before = s3.list_object_versions(Bucket=BUCKET, Prefix=PREFIX + "fotos/2013/")["Versions"]
     push_s3(app, None, None, dry_run=False)
-    versions_after = s3.list_object_versions(Bucket=BUCKET, Prefix=PREFIX + "2013/")["Versions"]
+    versions_after = s3.list_object_versions(Bucket=BUCKET, Prefix=PREFIX + "fotos/2013/")["Versions"]
     assert len(versions_after) == len(versions_before)  # nichts überschrieben
     assert app.db.q1("SELECT COUNT(*) n FROM copies WHERE volume_id=? AND status='ok'", (app.cfg.s3.volume_id,))["n"] == 1
 
 
 def test_push_conflict_never_overwrites(app, hdd_a, s3):
-    _sealed(app, hdd_a, "2013.Österreich")
-    (b,) = app.db.bundles_of("2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
+    (b,) = app.db.bundles_of("fotos/2013.Österreich")
     s3.put_object(Bucket=BUCKET, Key=_key(b["relpath"]), Body=b"fremder Inhalt", Metadata={"sha256": "0" * 64})
     with pytest.raises(typer.Exit) as ei:
-        push_s3(app, ["2013.Österreich"], hdd_a, dry_run=False)
+        push_s3(app, ["fotos/2013.Österreich"], hdd_a, dry_run=False)
     assert ei.value.exit_code == 1
     assert s3.get_object(Bucket=BUCKET, Key=_key(b["relpath"]))["Body"].read() == b"fremder Inhalt"
     assert not app.db.q1("SELECT 1 FROM copies WHERE volume_id=?", (app.cfg.s3.volume_id,))
 
 
 def test_push_skips_without_connected_hdd(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
     shutil.rmtree(hdd_a.root)  # HDD "abgezogen"
     push_s3(app, None, None, dry_run=False)
     assert "keine HDD" in capsys.readouterr().out
@@ -285,13 +285,13 @@ def test_part_size():
 
 
 def test_verify_s3(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2026.Kenia", "2013.Österreich")
-    push_s3(app, ["2026.Kenia"], None, dry_run=False)
+    _sealed(app, hdd_a, "fotos/2026.Kenia", "fotos/2013.Österreich")
+    push_s3(app, ["fotos/2026.Kenia"], None, dry_run=False)
     vol = app.cfg.s3.volume_id
     verify_s3(app, None, deep=True)
     out = capsys.readouterr().out
     assert "ohne Befund" in out
-    kenia = app.db.bundles_of("2026.Kenia")
+    kenia = app.db.bundles_of("fotos/2026.Kenia")
     for b in kenia:
         assert app.db.q1("SELECT status FROM copies WHERE bundle_id=? AND volume_id=?", (b["id"], vol))["status"] == "ok"
 
@@ -299,7 +299,7 @@ def test_verify_s3(app, hdd_a, s3, capsys):
     gone = kenia[0]
     s3.delete_object(Bucket=BUCKET, Key=_key(gone["relpath"]))
     # 2) unbekanntes, falsches Objekt unter dem Key eines nicht hochgeladenen Pakets -> abweichend
-    (oe,) = app.db.bundles_of("2013.Österreich")
+    (oe,) = app.db.bundles_of("fotos/2013.Österreich")
     s3.put_object(Bucket=BUCKET, Key=_key(oe["relpath"]), Body=b"x" * 10, Metadata={"sha256": oe["sha256"]})
     with pytest.raises(typer.Exit):
         verify_s3(app, None, deep=False)
@@ -312,17 +312,17 @@ def test_verify_s3(app, hdd_a, s3, capsys):
     other = kenia[1]
     s3.put_object(Bucket=BUCKET, Key=_key(other["relpath"]), Body=b"kaputt", Metadata={"sha256": other["sha256"]})
     with pytest.raises(typer.Exit):
-        verify_s3(app, ["2026.Kenia"], deep=False)
+        verify_s3(app, ["fotos/2026.Kenia"], deep=False)
     assert app.db.q1("SELECT status FROM copies WHERE bundle_id=? AND volume_id=?", (other["id"], vol))["status"] == "bad"
 
 
 def test_verify_detects_unregistered_identical_object(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
     push_s3(app, None, None, dry_run=False)
     app.db.x("DELETE FROM copies WHERE volume_id=?", (app.cfg.s3.volume_id,))
     verify_s3(app, None, deep=False)
     assert "nachgetragen" in capsys.readouterr().out
-    (b,) = app.db.bundles_of("2013.Österreich")
+    (b,) = app.db.bundles_of("fotos/2013.Österreich")
     assert app.db.q1("SELECT status FROM copies WHERE bundle_id=? AND volume_id=?", (b["id"], app.cfg.s3.volume_id))["status"] == "ok"
 
 
@@ -334,11 +334,11 @@ def test_restore_from_s3(app, hdd_a, s3, hooks, capsys):
     hooks.append(("before-parameter-build.s3.GetObject", lambda params, **kw: gets.append(params["Key"])))
     root = app.cfg.source_root
     kenia = root / "2026.Kenia"
-    _sealed(app, hdd_a, "2026.Kenia")
+    _sealed(app, hdd_a, "fotos/2026.Kenia")
     # v2: geänderter Export -> beim Wiederherstellen muss die neueste Fassung gewinnen
     (kenia / "jpg" / "DSC02.jpg").write_bytes(b"neu bearbeitet v2")
     scan(app)
-    seal_series(app, "2026.Kenia", hdd_a)
+    seal_series(app, "fotos/2026.Kenia", hdd_a)
     push_s3(app, None, None, dry_run=False)
 
     originals = {p.relative_to(root).as_posix(): p.read_bytes() for p in kenia.rglob("*") if p.is_file()}
@@ -347,12 +347,12 @@ def test_restore_from_s3(app, hdd_a, s3, hooks, capsys):
     scan(app)
     shutil.rmtree(hdd_a.root)  # nur S3 verfügbar
 
-    restore_s3(app, "2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=True)
+    restore_s3(app, "fotos/2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=True)
     assert "Kostenschätzung" in capsys.readouterr().out
     assert app.db.q("SELECT * FROM restores") == []
 
     # Lauf 1: anfordern
-    restore_s3(app, "2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
+    restore_s3(app, "fotos/2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
     out = capsys.readouterr().out
     assert "angefordert" in out
     reqs = app.db.q("SELECT * FROM restores")
@@ -360,35 +360,35 @@ def test_restore_from_s3(app, hdd_a, s3, hooks, capsys):
     assert not (kenia / "raws").exists()
 
     # Lauf 2: (moto stellt sofort bereit) herunterladen, prüfen, entpacken
-    restore_s3(app, "2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
+    restore_s3(app, "fotos/2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
     for rel, data in originals.items():
         if "/raws/" in rel or "/jpg/" in rel:
             assert (root / rel).read_bytes() == data, rel
     assert (kenia / "jpg" / "DSC02.jpg").read_bytes() == b"neu bearbeitet v2"
     assert all(r["status"] == "downloaded" for r in app.db.q("SELECT * FROM restores"))
     assert not (root.parent / f".{root.name}{s3ops.STAGING_SUFFIX}").exists()
-    for r in app.db.q("SELECT * FROM files WHERE series='2026.Kenia' AND cls IN ('raw','img-derived')"):
-        st = (root / r["path"]).stat()
+    for r in app.db.q("SELECT * FROM files WHERE series='fotos/2026.Kenia' AND cls IN ('raw','img-derived')"):
+        st = app.cfg.source_file(r["path"]).stat()
         assert r["present"] == 1 and r["slimmed"] == 0
         assert r["size"] == st.st_size and r["mtime_ns"] == st.st_mtime_ns
-        assert r["sha256"] == hashlib.sha256((root / r["path"]).read_bytes()).hexdigest()
+        assert r["sha256"] == hashlib.sha256(app.cfg.source_file(r["path"]).read_bytes()).hexdigest()
     st = scan(app)
     assert st.changed == 0 and st.new == 0
 
     # Lauf 3: alles vorhanden -> kein Download mehr
     gets.clear()
-    restore_s3(app, "2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
+    restore_s3(app, "fotos/2026.Kenia", ["raw", "img-derived"], root, None, overwrite=False, dry_run=False)
     assert gets == []
     assert "bereits vorhanden" in capsys.readouterr().out
 
 
 def test_restore_into_other_target(app, hdd_a, s3, tmp_path):
-    _sealed(app, hdd_a, "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
     push_s3(app, None, None, dry_run=False)
     target = tmp_path / "ziel"
     target.mkdir()
-    restore_s3(app, "2013.Österreich", None, target, "standard", overwrite=False, dry_run=False)
-    restore_s3(app, "2013.Österreich", None, target, "standard", overwrite=False, dry_run=False)
+    restore_s3(app, "fotos/2013.Österreich", None, target, "standard", overwrite=False, dry_run=False)
+    restore_s3(app, "fotos/2013.Österreich", None, target, "standard", overwrite=False, dry_run=False)
     src = app.cfg.source_root / "2013.Österreich"
     for p in src.iterdir():
         assert (target / "2013.Österreich" / p.name).read_bytes() == p.read_bytes()
@@ -399,7 +399,7 @@ def test_restore_into_other_target(app, hdd_a, s3, tmp_path):
 
 
 def test_legacy_scan(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2013.Österreich")
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
     push_s3(app, None, None, dry_run=False)
     s3.put_object(Bucket=BUCKET, Key="fotos/2007/", Body=b"")
     s3.put_object(Bucket=BUCKET, Key="fotos/2007/2007.Schottland.tar", Body=b"t" * 1000, StorageClass="DEEP_ARCHIVE")
@@ -416,7 +416,7 @@ def test_legacy_scan(app, hdd_a, s3, capsys):
     }
     assert rows["fotos/2007/2007.Schottland.tar"]["storage_class"] == "DEEP_ARCHIVE"
     assert rows["fotos/ew2.jpg"]["storage_class"] == "STANDARD"
-    assert "2013.Österreich" in out or "Jahr 2013" in out
+    assert "fotos/2013.Österreich" in out or "Jahr 2013" in out
     assert "Altbestand: 3 Objekt(e)" in out
     # erneuter Lauf: idempotent
     legacy_scan(app)
@@ -428,9 +428,48 @@ def test_tool_key_classification():
     assert s3ops.is_tool_key("_ohne-jahr/sortiert/v12/manifest.json.gz")
     assert s3ops.is_tool_key("_index/index-20261112T000000Z.sqlite.gz")
     assert s3ops.is_tool_key("_kataloge/20261112T000000Z/digikam4.db.gz")
+    assert s3ops.is_tool_key("Beatles/v1/audio-001.tar")  # Sammlung ohne Jahresebene
     assert not s3ops.is_tool_key("2007/2007.Schottland.tar")
     assert not s3ops.is_tool_key("2024/2024_folders_20250928_102513.tar")
     assert not s3ops.is_tool_key("ew2.jpg")
+
+
+def test_push_and_restore_second_collection(app, hdd_a, s3, tmp_path, capsys):
+    from conftest import OLD, _write
+
+    from foto_archiv.config import Collection
+
+    musik = tmp_path / "Musik"
+    _write(musik / "Beatles" / "01.flac", 20_000, 1, OLD)
+    app.cfg.collections.append(Collection(id="musik", source_root=musik, profile="media", year="none", archive_dir="Musik"))
+    _sealed(app, hdd_a, "fotos/2013.Österreich", "musik/Beatles")
+    push_s3(app, None, None, dry_run=False)
+    keys = _keys(s3)
+    assert "Musik/Beatles/v1/audio-001.tar" in keys and "Musik/Beatles/v1/manifest.json.gz" in keys
+    assert any(k.startswith("fotos/2013/2013.Österreich/v1/") for k in keys)
+    # Altbestand im Musikordner wird erkannt, Tool-Objekte nicht
+    s3.put_object(Bucket=BUCKET, Key="Musik/alt.zip", Body=b"z")
+    legacy_scan(app)
+    assert {r["key"] for r in app.db.q("SELECT key FROM legacy")} == {"Musik/alt.zip"}
+
+    (musik / "Beatles" / "01.flac").unlink()
+    shutil.rmtree(hdd_a.root)
+    restore_s3(app, "musik/Beatles", None, None, "standard", overwrite=False, dry_run=False)
+    restore_s3(app, "musik/Beatles", None, None, "standard", overwrite=False, dry_run=False)
+    assert (musik / "Beatles" / "01.flac").stat().st_size == 20_000
+
+
+def test_restore_with_staging_dir(app, hdd_a, s3, tmp_path):
+    _sealed(app, hdd_a, "fotos/2013.Österreich")
+    push_s3(app, None, None, dry_run=False)
+    target, staging = tmp_path / "ziel", tmp_path / "extern"
+    staging.mkdir()
+    for _ in range(2):
+        restore_s3(app, "fotos/2013.Österreich", None, target, "standard", overwrite=False, dry_run=False, staging=staging)
+    assert len(list((target / "2013.Österreich").iterdir())) == 3
+    assert not (staging / f"foto-archiv{s3ops.STAGING_SUFFIX}").exists() or not any(
+        (staging / f"foto-archiv{s3ops.STAGING_SUFFIX}").rglob("*.tar")
+    )
 
 
 # ---------------------------------------------------------------------------- Kataloge
@@ -510,7 +549,7 @@ def test_push_with_upload_limit(app, hdd_a, s3, capsys, monkeypatch):
 
 
 def test_push_invalid_upload_limit(app, hdd_a, s3):
-    _sealed(app, hdd_a, "2026.Kenia")
+    _sealed(app, hdd_a, "fotos/2026.Kenia")
     app.cfg.s3.upload_limit = "ganz schnell"
     with pytest.raises(typer.Exit):
         push_s3(app, None, None, dry_run=False)
@@ -518,7 +557,7 @@ def test_push_invalid_upload_limit(app, hdd_a, s3):
 
 
 def test_push_with_upload_schedule(app, hdd_a, s3, capsys):
-    _sealed(app, hdd_a, "2026.Kenia")
+    _sealed(app, hdd_a, "fotos/2026.Kenia")
     app.cfg.s3.upload_schedule = ["00:00-24:00=50MB/s"]
     push_s3(app, None, None, dry_run=True)
     out = capsys.readouterr().out
@@ -529,7 +568,7 @@ def test_push_with_upload_schedule(app, hdd_a, s3, capsys):
 
 
 def test_push_invalid_upload_schedule(app, hdd_a, s3):
-    _sealed(app, hdd_a, "2026.Kenia")
+    _sealed(app, hdd_a, "fotos/2026.Kenia")
     app.cfg.s3.upload_schedule = ["tagsüber=2MB/s"]
     with pytest.raises(typer.Exit):
         push_s3(app, None, None, dry_run=False)

@@ -37,15 +37,15 @@ def test_classify():
 def test_scan_classes_and_excludes(app):
     st = scan(app)
     rows = {r["path"]: r for r in app.db.q("SELECT * FROM files")}
-    assert "2026.Kenia/Thumbs.db" not in rows
-    assert "digikam4.db" not in rows
-    assert not any(p.startswith(".dtrash") for p in rows)
-    assert rows["2026.Kenia/raws/DSC01.ARW"]["cls"] == "raw"
-    assert rows["2026.Kenia/raws/DSC01.ARW.pp3"]["cls"] == "raw"
-    assert rows["2026.Kenia/jpg/DSC01-1.jpg"]["cls"] == "img-derived"
-    assert rows["2026.Kenia/pixel/PXL_20260201.jpg"]["cls"] == "img-original"
-    assert rows["2026.Kenia/clips/C0001.MP4"]["cls"] == "video"
-    assert rows["sortiert/a.png"]["series"] == "sortiert"
+    assert "fotos/2026.Kenia/Thumbs.db" not in rows
+    assert "fotos/digikam4.db" not in rows
+    assert not any(p.startswith("fotos/.dtrash") for p in rows)
+    assert rows["fotos/2026.Kenia/raws/DSC01.ARW"]["cls"] == "raw"
+    assert rows["fotos/2026.Kenia/raws/DSC01.ARW.pp3"]["cls"] == "raw"
+    assert rows["fotos/2026.Kenia/jpg/DSC01-1.jpg"]["cls"] == "img-derived"
+    assert rows["fotos/2026.Kenia/pixel/PXL_20260201.jpg"]["cls"] == "img-original"
+    assert rows["fotos/2026.Kenia/clips/C0001.MP4"]["cls"] == "video"
+    assert rows["fotos/sortiert/a.png"]["series"] == "fotos/sortiert"
     assert st.excluded >= 3
     # zweiter Scan: nichts neu
     st2 = scan(app)
@@ -55,35 +55,36 @@ def test_scan_classes_and_excludes(app):
 def test_status_states(app):
     scan(app)
     states = {s.name: s.state for s in compute_status(app)}
-    assert states["2026.Kenia"] == "abschlussreif"
-    assert states["2013.Österreich"] == "abschlussreif"  # keine RAWs -> nur Ruhezeit zählt
-    assert states["2026.London"] == "aktiv"
+    assert states["fotos/2026.Kenia"] == "abschlussreif"
+    assert states["fotos/2013.Österreich"] == "abschlussreif"  # keine RAWs -> nur Ruhezeit zählt
+    assert states["fotos/2026.London"] == "aktiv"
 
 
 def test_seal_and_extract(app, hdd_a, tmp_path):
     scan(app)
-    plan = seal_series(app, "2026.Kenia", hdd_a)
+    plan = seal_series(app, "fotos/2026.Kenia", hdd_a)
     assert plan is not None and plan.version == 1
     # raw (5*30KB + pp3) in 1 MiB-Paketen -> 1 Paket; alle Klassen vorhanden
-    bundles = app.db.bundles_of("2026.Kenia")
+    bundles = app.db.bundles_of("fotos/2026.Kenia")
     classes = {b["cls"] for b in bundles}
     assert classes == {"raw", "img-derived", "img-original", "video"}
     for b in bundles:
         p = hdd_a.path_for(b["relpath"])
         assert p.exists() and p.stat().st_size == b["size"]
-        assert b["relpath"].startswith("2026/2026.Kenia/v1/")
-    man = json.loads(gzip.decompress(hdd_a.path_for("2026/2026.Kenia/v1/manifest.json.gz").read_bytes()))
-    assert man["series"] == "2026.Kenia" and man["version"] == 1
+        assert b["relpath"].startswith("fotos/2026/2026.Kenia/v1/")
+    man = json.loads(gzip.decompress(hdd_a.path_for("fotos/2026/2026.Kenia/v1/manifest.json.gz").read_bytes()))
+    assert man["series"] == "2026.Kenia" and man["version"] == 1 and man["collection"] == "fotos"
+    assert man["files"][0]["path"].startswith("2026.Kenia/")  # relativ zum Quellordner, wie im Tar
     assert len(man["files"]) == app.db.q1("SELECT COUNT(*) n FROM archived")["n"] == 18
 
     # erneutes Versiegeln: nichts zu tun
-    assert plan_seal(app, "2026.Kenia") is None
-    st = {s.name: s for s in compute_status(app)}["2026.Kenia"]
+    assert plan_seal(app, "fotos/2026.Kenia") is None
+    st = {s.name: s for s in compute_status(app)}["fotos/2026.Kenia"]
     assert st.state == "versiegelt" and st.hdd_full == 1 and not st.s3_full
 
     # Entpacken eines Pakets in ein leeres Ziel mit Hash-Prüfung
     raw = next(b for b in bundles if b["cls"] == "raw")
-    expected = {r["path"]: r["sha256"] for r in app.db.q("SELECT path, sha256 FROM archived WHERE bundle_id=?", (raw["id"],))}
+    expected = {r["path"].removeprefix("fotos/"): r["sha256"] for r in app.db.q("SELECT path, sha256 FROM archived WHERE bundle_id=?", (raw["id"],))}
     out = tmp_path / "restore"
     stats = extract_bundle(hdd_a.path_for(raw["relpath"]), out, expected)
     assert len(stats.written) == 10 and not stats.hash_errors
@@ -98,18 +99,18 @@ def test_seal_and_extract(app, hdd_a, tmp_path):
 
 def test_seal_v2_only_changes(app, hdd_a):
     scan(app)
-    seal_series(app, "2026.Kenia", hdd_a)
+    seal_series(app, "fotos/2026.Kenia", hdd_a)
     root = app.cfg.source_root / "2026.Kenia"
     (root / "jpg" / "DSC02.jpg").write_bytes(b"neu bearbeitet")
     (root / "jpg" / "neu.jpg").write_bytes(b"neuer export")
     os.utime(root / "raws" / "DSC03.ARW")  # nur mtime geändert, Inhalt gleich
     scan(app)
-    st = {s.name: s for s in compute_status(app)}["2026.Kenia"]
+    st = {s.name: s for s in compute_status(app)}["fotos/2026.Kenia"]
     assert st.state == "geändert"
-    plan = seal_series(app, "2026.Kenia", hdd_a)
+    plan = seal_series(app, "fotos/2026.Kenia", hdd_a)
     assert plan.version == 2
-    assert sorted(i.path for i in plan.items) == ["2026.Kenia/jpg/DSC02.jpg", "2026.Kenia/jpg/neu.jpg"]
-    assert {s.name: s for s in compute_status(app)}["2026.Kenia"].state == "versiegelt"
+    assert sorted(i.path for i in plan.items) == ["fotos/2026.Kenia/jpg/DSC02.jpg", "fotos/2026.Kenia/jpg/neu.jpg"]
+    assert {s.name: s for s in compute_status(app)}["fotos/2026.Kenia"].state == "versiegelt"
 
 
 def test_chunking(app, hdd_a, pictures):
@@ -118,10 +119,10 @@ def test_chunking(app, hdd_a, pictures):
         (big / f"DSC1{i}.ARW").parent.mkdir(parents=True, exist_ok=True)
         (big / f"DSC1{i}.ARW").write_bytes(os.urandom(400_000))
     scan(app)
-    seal_series(app, "2025.Gross", hdd_a)
-    names = [b["name"] for b in app.db.bundles_of("2025.Gross")]
+    seal_series(app, "fotos/2025.Gross", hdd_a)
+    names = [b["name"] for b in app.db.bundles_of("fotos/2025.Gross")]
     assert names == ["raw-001.tar", "raw-002.tar", "raw-003.tar"]  # 1 MiB-Limit -> 2 Dateien je Paket
-    for b in app.db.bundles_of("2025.Gross"):
+    for b in app.db.bundles_of("fotos/2025.Gross"):
         with tarfile.open(hdd_a.path_for(b["relpath"])) as tf:
             assert len(tf.getnames()) == 2
 

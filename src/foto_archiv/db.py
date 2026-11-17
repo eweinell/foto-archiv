@@ -1,6 +1,10 @@
 """Lokaler Index (SQLite).
 
-Alle Pfade sind relativ zu ``source_root`` und mit ``/`` getrennt.
+Pfade (``files.path``, ``archived.path``) und Seriennamen tragen die Sammlung als erste Ebene
+(``fotos/2026.Kenia/raws/DSC01.ARW``), danach relativ zum Quellordner der Sammlung, mit ``/``.
+``bundles.relpath`` und ``versions.manifest_relpath`` sind die Ablagepfade im Archiv; sie werden
+beim Versiegeln festgeschrieben und nie neu berechnet.
+Schema 1 (vor Sammlungen) wird mit ``foto-archiv migrate`` umgestellt.
 Ein *Volume* ist ein Speicherort für Pakete: eine HDD (``kind='hdd'``) oder S3 (``kind='s3'``,
 id = ``s3:<bucket>/<prefix>``). ``copies`` hält fest, welches Paket auf welchem Volume liegt.
 """
@@ -12,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -167,6 +171,19 @@ class Index:
 
     def close(self) -> None:
         self.conn.close()
+
+    @property
+    def schema_version(self) -> int:
+        return int(self.meta_get("schema_version") or SCHEMA_VERSION)
+
+    def meta_get(self, key: str) -> str | None:
+        r = self.q1("SELECT value FROM meta WHERE key=?", (key,))
+        return r["value"] if r else None
+
+    def meta_set(self, key: str, value: str, conn=None) -> None:
+        (conn or self.conn).execute(
+            "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)
+        )
 
     # ------------------------------------------------------------------ helpers
     @contextmanager

@@ -59,6 +59,11 @@ foto-archiv restore 2026.Kenia --class raw            # von HDD (falls angeschlo
 foto-archiv restore 2026.Kenia --from s3 --tier Bulk  # mehrfach aufrufen bis fertig (≤ 48 h)
 foto-archiv restore videos/2024.Hochzeit --staging F:\  # Zwischenablage auf externer Platte (große Videos)
 
+foto-archiv hdd clean                # Vorschau: Reste abgebrochener seal/copy-hdd auf den Platten
+foto-archiv hdd clean --apply
+foto-archiv drop videos/_root        # Vorschau: versiegelte Serie wieder entfernen (nur wenn noch nicht in S3)
+foto-archiv drop videos/_root --apply
+
 foto-archiv legacy scan              # Altbestand im Bucket auflisten
 foto-archiv catalog backup           # digiKam-Datenbanken sichern
 ```
@@ -120,6 +125,16 @@ foto-archiv hdd migrate HDD-B        # weitere Platte, sobald angeschlossen (ver
 
 Die S3-Keys bleiben dabei unverändert: aus `prefix = "fotos/"` wird `prefix = ""` plus `archive_dir = "fotos"`.
 Platten im alten Format werden bis zu ihrer Umstellung nicht benutzt.
+
+### Aufräumen und Entfernen
+
+- `hdd clean` löscht nur, was der Index nicht kennt und erkennbar unvollständig ist: Pakete in Versionsordnern ohne
+  Manifest, Pakete neben einem Manifest, die nicht zu dieser Version gehören, `*.foto-archiv-partial` und danach leere
+  Ordner. Eine vollständige Version (mit Manifest), die der Index nicht kennt, und fremde Dateien werden nur gemeldet.
+- `drop SERIE` entfernt versiegelte Versionen von allen angeschlossenen Platten und aus dem Index, `--version N` nur die
+  neueste. Abgelehnt wird, wenn etwas davon in S3 liegt oder ein Upload läuft, wenn lokal ausgedünnte Dateien nur dort
+  liegen oder wenn eine Platte mit Kopie nicht angeschlossen ist. In S3 löscht das Tool nie.
+  Damit `seal --ripe` die Dateien nicht erneut versiegelt, die Serie bzw. Dateien per `exclude_paths` ausschließen.
 
 Upload-Bandbreite dauerhaft festlegen, in der Konfiguration unter `[s3]`:
 

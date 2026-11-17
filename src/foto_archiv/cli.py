@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from . import hddops, s3ops
+from . import cleanup, hddops, s3ops
 from .config import (
     DEFAULT_COLLECTION,
     Collection,
@@ -383,6 +383,53 @@ def hdd_relabel(
         _fail(str(e))
     export_index(a, v)
     console.print(f"[green]Volume umbenannt:[/] {old} → {v.label}  ({v.root})")
+
+
+@hdd_app.command("clean")
+def hdd_clean(
+    volume: Annotated[Optional[str], typer.Argument(help="Volume (Label, ID oder Pfad); leer = alle angeschlossenen")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="wirklich löschen (sonst nur Vorschau)")] = False,
+):
+    """Reste abgebrochener Vorgänge löschen: Pakete ohne Index-Eintrag und Manifest, *.foto-archiv-partial, leere Ordner."""
+    a = get_app()
+    if volume:
+        try:
+            vols = [resolve_volume(a.cfg, a.db, volume)]
+        except VolumeError as e:
+            _fail(str(e))
+    else:
+        vols = find_connected(a.cfg, a.db)
+        if not vols:
+            _fail("Kein Archiv-Volume angeschlossen.")
+    errors = 0
+    for v in vols:
+        errors += len(cleanup.clean_hdd(a, v, apply).errors)
+    if errors:
+        raise typer.Exit(1)
+
+
+@app.command()
+def drop(
+    series: Annotated[str, typer.Argument(help="Serie (z. B. videos/_root oder 2025.Konzerte)")],
+    version: Annotated[Optional[int], typer.Option("--version", help="nur diese Version (muss die neueste sein); leer = alle")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="wirklich löschen (sonst nur Vorschau)")] = False,
+):
+    """Versiegelte Versionen entfernen, die nur auf HDDs liegen (nie aus S3). Alle Platten mit Kopien müssen angeschlossen sein."""
+    a = get_app()
+    s = resolve_one(a, series)
+    connected = find_connected(a.cfg, a.db)
+    try:
+        plan = cleanup.plan_drop(a, s, version, connected)
+    except cleanup.DropError as e:
+        _fail(str(e))
+    cleanup.render_drop(a, plan, connected)
+    if plan.blockers:
+        raise typer.Exit(1)
+    if not apply:
+        console.print("[dim]Vorschau - mit --apply ausführen.")
+        return
+    if cleanup.drop_series(a, plan, connected):
+        raise typer.Exit(1)
 
 
 @hdd_app.command("list")

@@ -310,5 +310,83 @@ def test_seal_unknown_collection(app):
         seal_mod.plan_seal(app, "gibtsnicht/x")
 
 
+def _videos_with_junk(multi, tmp_path):
+    v = tmp_path / "Videos"
+    _write(v / "tmp" / "export-test.mp4", 5_000, 11, OLD)
+    _write(v / "2024.Hochzeit" / "veraltet" / "alt.mp4", 6_000, 12, OLD)
+    _write(v / "2024.Hochzeit" / "Render-Cache" / "c.bin", 1_000, 13, OLD)
+    _write(v / "Urlaub-ohne-Jahr" / "veraltet" / "bleibt.mov", 2_000, 14, OLD)  # anderer Pfad: nicht betroffen
+    _write(v / "Urlaub-ohne-Jahr" / "[alt]" / "x.mov", 2_000, 15, OLD)
+    _write(v / "Urlaub-ohne-Jahr" / "a" / "y.mov", 2_000, 16, OLD)  # "[alt]" ist kein Zeichenklassen-Muster
+    return multi.cfg.find_collection("videos")
+
+
+def test_exclude_paths_scan(multi, tmp_path):
+    videos = _videos_with_junk(multi, tmp_path)
+    videos.exclude_paths = [
+        "TMP", "2024.Hochzeit/veraltet", "*/render-cache", "2024.Hochzeit/projekt.kdenlive", "Urlaub-ohne-Jahr/[alt]",
+    ]
+    multi.cfg.validate()
+    st = scan(multi)
+    rows = _files(multi)
+    vids = {p for p in rows if p.startswith("videos/")}
+    assert vids == {
+        "videos/2024.Hochzeit/Film.mp4",
+        "videos/Urlaub-ohne-Jahr/clip.mov",
+        "videos/Urlaub-ohne-Jahr/veraltet/bleibt.mov",
+        "videos/Urlaub-ohne-Jahr/a/y.mov",
+    }
+    assert "videos/tmp" not in {s for s in st.series}
+    assert set(st.skipped) >= {
+        "videos/tmp/", "videos/2024.Hochzeit/veraltet/", "videos/2024.Hochzeit/Render-Cache/",
+        "videos/2024.Hochzeit/projekt.kdenlive",
+    }
+
+
+def test_exclude_paths_added_later(multi, tmp_path, hdd_a):
+    videos = _videos_with_junk(multi, tmp_path)
+    scan(multi)
+    seal_series(multi, "videos/2024.Hochzeit", hdd_a)  # veraltet/alt.mp4 ist schon im Archiv
+    assert _files(multi)["videos/tmp/export-test.mp4"]["present"] == 1
+
+    videos.exclude_paths = ["tmp", "2024.Hochzeit/veraltet"]
+    st = scan(multi)
+    rows = _files(multi)
+    # nie archiviert -> aus dem Index entfernt, Serie verschwindet
+    assert "videos/tmp/export-test.mp4" not in rows and st.dropped == 1
+    assert not multi.db.q1("SELECT 1 FROM series WHERE name='videos/tmp'")
+    assert "videos/tmp" not in {s.name for s in compute_status(multi)}
+    # archiviert -> bleibt im Archiv, gilt lokal als nicht vorhanden; kein neues Versiegeln nötig
+    assert rows["videos/2024.Hochzeit/veraltet/alt.mp4"]["present"] == 0
+    (hz,) = compute_status(multi, ["videos/2024.Hochzeit"])
+    assert hz.state == "versiegelt"
+    assert seal_mod.plan_seal(multi, "videos/2024.Hochzeit") is None
+    # Restore holt auch Ausgeschlossenes zurück, das Archiv ist unverändert
+    res = restore_hdd(multi, "videos/2024.Hochzeit", ["video"], tmp_path / "zurueck", hdd_a, overwrite=False, dry_run=False)
+    assert "2024.Hochzeit/veraltet/alt.mp4" in res.written
+
+
+def test_exclude_paths_config(tmp_path):
+    c = Collection(id="videos", source_root=tmp_path, exclude_paths=["\\tmp\\", "./2024.Hochzeit\\veraltet/"])
+    assert c.exclude_paths == ["tmp", "2024.Hochzeit/veraltet"]
+    p = tmp_path / "config.toml"
+    p.write_text(
+        f'index_path = "{(tmp_path / "i.sqlite").as_posix()}"\n[[collections]]\nid = "videos"\n'
+        f'source_root = "{tmp_path.as_posix()}"\nexclude_paths = ["tmp", "*/veraltet"]\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(p)
+    assert cfg.collections[0].exclude_paths == ["tmp", "*/veraltet"]
+    assert 'exclude_paths = ["tmp", "*/veraltet"]' in render_config(cfg)
+    for bad in ["../x", "", "**/tmp", "C:/x"]:
+        p.write_text(
+            f'index_path = "{(tmp_path / "i.sqlite").as_posix()}"\n[[collections]]\nid = "videos"\n'
+            f'source_root = "{tmp_path.as_posix()}"\nexclude_paths = ["{bad}"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="exclude_paths"):
+            load_config(p)
+
+
 def test_conftest_paths_are_tmp(app, tmp_path):
     assert Path(app.cfg.collections[0].source_root).is_relative_to(tmp_path)

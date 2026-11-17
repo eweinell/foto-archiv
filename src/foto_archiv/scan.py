@@ -22,6 +22,8 @@ class ScanStats:
     changed: int = 0
     gone: int = 0
     excluded: int = 0
+    dropped: int = 0  # nie archivierte, jetzt ausgeschlossene Einträge aus dem Index entfernt
+    skipped: list[str] = field(default_factory=list)  # ausgeschlossene Ordner / exclude_paths-Treffer
     series: set[str] = field(default_factory=set)
     collections: list[str] = field(default_factory=list)  # erfasste Sammlungen
     missing: list[str] = field(default_factory=list)  # Sammlungen, deren Quellordner fehlt
@@ -37,7 +39,7 @@ class _Found:
     profile: str
 
 
-def _excluded(name: str, patterns_lower: list[str]) -> bool:
+def _match_any(name: str, patterns_lower: list[str]) -> bool:
     n = name.lower()
     return any(fnmatch.fnmatchcase(n, p) for p in patterns_lower)
 
@@ -46,11 +48,54 @@ def _norm(p) -> str:
     return os.path.normcase(os.path.abspath(p))
 
 
-def walk_collection(app: App, coll: Collection) -> tuple[list[_Found], int]:
+class Excluder:
+    """Ausschlussregeln einer Sammlung; Pfade relativ zum Quellordner, Groß-/Kleinschreibung egal.
+
+    - ``exclude_names`` / ``exclude_dirs`` (global + Sammlung): Datei- bzw. Ordnernamen in jeder Tiefe
+    - ``exclude_paths`` (Sammlung): ein bestimmter Pfad samt Inhalt; ``*`` gilt innerhalb eines Namens
+    - Katalog-Datenbanken direkt im Quellordner einer Foto-Sammlung
+    """
+
+    def __init__(self, cfg, coll: Collection) -> None:
+        self.names = [p.lower() for p in [*cfg.exclude_names, *coll.exclude_names]]
+        self.dirs = [p.lower() for p in [*cfg.exclude_dirs, *coll.exclude_dirs]]
+        # nur * und ? sind Platzhalter; [ ] gehören zum Namen (Ordner wie "[alt]")
+        self.paths = [tuple(p.lower().replace("[", "[[]").split("/")) for p in coll.exclude_paths]
+        self.catalogs = {c.lower() for c in cfg.catalog_files} if coll.profile == "photo" else set()
+
+    def path_rule(self, rel: str) -> str | None:
+        """Passendes exclude_paths-Muster für genau diesen Pfad (nicht seine Eltern)."""
+        segs = rel.lower().split("/")
+        for pat in self.paths:
+            if len(pat) == len(segs) and all(fnmatch.fnmatchcase(s, p) for s, p in zip(segs, pat)):
+                return "/".join(pat).replace("[[]", "[")
+        return None
+
+    def dir_excluded(self, rel: str) -> bool:
+        return _match_any(rel.rsplit("/", 1)[-1], self.dirs) or self.path_rule(rel) is not None
+
+    def file_excluded(self, rel: str) -> bool:
+        name = rel.rsplit("/", 1)[-1]
+        if _match_any(name, self.names) or self.path_rule(rel) is not None:
+            return True
+        return "/" not in rel and name.lower() in self.catalogs
+
+    def excluded(self, rel: str) -> bool:
+        """Für einen Index-Pfad (Datei): liegt er selbst oder einer seiner Ordner im Ausschluss?"""
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            if self.dir_excluded("/".join(parts[:i])):
+                return True
+        return self.file_excluded(rel)
+
+
+def walk_collection(
+    app: App, coll: Collection, skipped: list[str] | None = None
+) -> tuple[list[_Found], int]:
+    """Quellordner durchsuchen. ``skipped`` sammelt ausgeschlossene Ordner und per exclude_paths
+    ausgeschlossene Dateien (Index-Pfade, Ordner mit abschließendem ``/``)."""
     cfg = app.cfg
-    name_pats = [p.lower() for p in [*cfg.exclude_names, *coll.exclude_names]]
-    dir_pats = [p.lower() for p in [*cfg.exclude_dirs, *coll.exclude_dirs]]
-    catalogs = {c.lower() for c in cfg.catalog_files} if coll.profile == "photo" else set()
+    rules = Excluder(cfg, coll)
     # Quellordner anderer Sammlungen innerhalb dieses Ordners gehören dorthin, nicht hierher
     own = _norm(coll.source_root)
     nested = {_norm(c.source_root) for c in cfg.collections if c.id != coll.id and _norm(c.source_root) != own}
@@ -69,13 +114,19 @@ def walk_collection(app: App, coll: Collection) -> tuple[list[_Found], int]:
                 r = f"{rel}/{e.name}" if rel else e.name
                 try:
                     if e.is_dir(follow_symlinks=False):
-                        if _excluded(e.name, dir_pats) or _norm(e.path) in nested:
+                        if _norm(e.path) in nested:
+                            continue  # eigene Sammlung
+                        if rules.dir_excluded(r):
                             excluded += 1
+                            if skipped is not None:
+                                skipped.append(f"{coll.id}/{r}/")
                             continue
                         rec(e.path, r, series or e.name)
                     elif e.is_file(follow_symlinks=False):
-                        if _excluded(e.name, name_pats) or (series is None and e.name.lower() in catalogs):
+                        if rules.file_excluded(r):
                             excluded += 1
+                            if skipped is not None and rules.path_rule(r) is not None:
+                                skipped.append(f"{coll.id}/{r}")
                             continue
                         st = e.stat(follow_symlinks=False)
                         found.append(
@@ -109,7 +160,7 @@ def scan(app: App, do_hash: bool = False, only: list[str] | None = None) -> Scan
             app.console.print(f"[yellow]Sammlung {coll.id}: Quellordner fehlt ({coll.source_root}) - übersprungen.")
             continue
         with app.console.status(f"Durchsuche {coll.source_root} …"):
-            f, ex = walk_collection(app, coll)
+            f, ex = walk_collection(app, coll, stats.skipped)
         found += f
         stats.excluded += ex
         stats.collections.append(coll.id)
@@ -128,6 +179,7 @@ def scan(app: App, do_hash: bool = False, only: list[str] | None = None) -> Scan
             raw_keys.setdefault(r["series"], set()).add(raw_key(name))
 
     existing = {r["path"]: r for r in db.q("SELECT path, size, mtime_ns, sha256, cls FROM files")}
+    seen = {f.rel for f in found}
     with db.tx() as c:
         for f in found:
             stats.files += 1
@@ -152,12 +204,35 @@ def scan(app: App, do_hash: bool = False, only: list[str] | None = None) -> Scan
                     (f.series, cls, f.size, f.mtime_ns, old["sha256"] if unchanged else None, now, f.rel),
                 )
         for cid in stats.collections:
-            cur = c.execute(
-                """UPDATE files SET present=0 WHERE present=1 AND (last_seen IS NULL OR last_seen<>?)
-                   AND substr(path, 1, ?)=?""",
-                (now, len(cid) + 1, cid + "/"),
-            )
-            stats.gone += cur.rowcount
+            # Jetzt ausgeschlossene Einträge: nie archiviert -> aus dem Index entfernen. Archivierte
+            # (oder per slim entfernte) bleiben als "lokal nicht vorhanden" erhalten; das Archiv ändert sich nie.
+            ex = Excluder(app.cfg, app.cfg.collection(cid))
+            if ex.paths or ex.dirs or ex.names:
+                stale = [
+                    r["path"]
+                    for r in c.execute(
+                        """SELECT path FROM files f WHERE substr(path, 1, ?)=? AND slimmed=0
+                           AND NOT EXISTS (SELECT 1 FROM archived a WHERE a.path=f.path)""",
+                        (len(cid) + 1, cid + "/"),
+                    )
+                    if ex.excluded(r["path"].partition("/")[2])
+                ]
+                c.executemany("DELETE FROM files WHERE path=?", [(p,) for p in stale])
+                stats.dropped += len(stale)
+            # nicht mehr gefunden -> lokal nicht vorhanden (Abgleich über Pfade, nicht über den Zeitstempel)
+            gone = [
+                r["path"]
+                for r in c.execute(
+                    "SELECT path FROM files WHERE present=1 AND substr(path, 1, ?)=?", (len(cid) + 1, cid + "/")
+                )
+                if r["path"] not in seen
+            ]
+            c.executemany("UPDATE files SET present=0 WHERE path=?", [(p,) for p in gone])
+            stats.gone += len(gone)
+        c.execute(
+            """DELETE FROM series WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.series=series.name)
+               AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.series=series.name)"""
+        )
         for s in stats.series:
             coll = app.cfg.collection_of(s)
             c.execute(

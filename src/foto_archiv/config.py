@@ -38,6 +38,15 @@ class ConfigError(Exception):
     pass
 
 
+def normalize_exclude_path(p: str) -> str:
+    """``\\`` → ``/``, führende ``./`` und ``/`` sowie abschließende ``/`` entfernen."""
+    s = str(p).replace("\\", "/").strip()
+    while s.startswith("./"):
+        s = s[2:]
+    s = s.strip("/")
+    return "/".join(seg for seg in s.split("/") if seg not in ("", "."))
+
+
 def default_config_path() -> Path:
     env = os.environ.get("FOTO_ARCHIV_CONFIG")
     if env:
@@ -89,11 +98,14 @@ class Collection:
     settle_days: int | None = None  # leer = globaler Wert
     exclude_names: list[str] = field(default_factory=list)  # zusätzlich zu den globalen Mustern
     exclude_dirs: list[str] = field(default_factory=list)
+    # Pfade relativ zum Quellordner ("tmp", "2024.Hochzeit/veraltet", "*/proxy"); samt Inhalt ausgeschlossen
+    exclude_paths: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.source_root = Path(self.source_root).expanduser()
         if not self.archive_dir:
             self.archive_dir = self.id
+        self.exclude_paths = [normalize_exclude_path(p) for p in self.exclude_paths]
 
     def source_path(self, rel: str) -> Path:
         return self.source_root.joinpath(*rel.split("/")) if rel else self.source_root
@@ -183,6 +195,12 @@ class Config:
             if key in roots:
                 raise ConfigError(f"Sammlungen '{roots[key]}' und '{c.id}' haben denselben Quellordner.")
             roots[key] = c.id
+            for p in c.exclude_paths:
+                if not p or ".." in p.split("/") or ":" in p or "**" in p:
+                    raise ConfigError(
+                        f"Sammlung '{c.id}': exclude_paths-Eintrag '{p}' ungültig "
+                        "(Pfad relativ zum Quellordner, z. B. \"tmp\" oder \"2024.Hochzeit/veraltet\"; * nur innerhalb eines Ordnernamens)."
+                    )
         if self.s3.prefix and not self.s3.prefix.endswith("/"):
             raise ConfigError("[s3] prefix muss mit / enden (oder leer sein).")
 
@@ -282,6 +300,8 @@ def render_config(cfg: Config) -> str:
         "# id steht im Index und bleibt fest; archive_dir lässt sich ändern (gilt für neue Versionen).",
         "# profile: photo (RAW/Export-Abgleich) | media (nur Dateiendung, z. B. Videos, Musik)",
         "# year: name (Jahresebene aus dem Ordnernamen, sonst _ohne-jahr) | none (keine Jahresebene)",
+        "# exclude_paths: Pfade relativ zum Quellordner, samt Inhalt ausgeschlossen, z. B. [\"tmp\", \"2024.Hochzeit/veraltet\"];",
+        "#   * gilt innerhalb eines Namens (\"*/veraltet\" = in jeder Serie). exclude_dirs/exclude_names: Namen in jeder Tiefe.",
     ]
     for c in cfg.collections:
         lines += [
@@ -299,6 +319,8 @@ def render_config(cfg: Config) -> str:
             lines.append(f"exclude_names = {_toml_value(c.exclude_names)}")
         if c.exclude_dirs:
             lines.append(f"exclude_dirs = {_toml_value(c.exclude_dirs)}")
+        if c.exclude_paths:
+            lines.append(f"exclude_paths = {_toml_value(c.exclude_paths)}")
     return "\n".join(lines) + "\n"
 
 

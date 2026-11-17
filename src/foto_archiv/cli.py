@@ -8,6 +8,7 @@ from typing import Annotated, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import hddops, s3ops
@@ -197,6 +198,11 @@ def collections_cmd():
             str(loc["n"]), human(loc["s"]), human(sealed["s"]),
         )
     console.print(t)
+    for c in a.cfg.collections:
+        rules = [*(f"{p}" for p in c.exclude_paths), *(f"{d}/ (überall)" for d in c.exclude_dirs),
+                 *(f"{n} (überall)" for n in c.exclude_names)]
+        if rules:
+            console.print(f"[bold]{c.id}[/] ausgeschlossen: " + escape(", ".join(rules)), highlight=False)
     if s3root:
         console.print(f"S3: {s3root}<Archivordner>/ · HDD: <Laufwerk>\\{a.cfg.volume_dir}\\<Archivordner>\\")
 
@@ -206,6 +212,9 @@ def collections_cmd():
 def scan_cmd(
     collection: Annotated[Optional[list[str]], typer.Argument(help="nur diese Sammlungen; leer = alle")] = None,
     do_hash: Annotated[bool, typer.Option("--hash", help="fehlende Prüfsummen berechnen (liest alle neuen Dateien)")] = False,
+    show_excluded: Annotated[
+        bool, typer.Option("--excluded", help="ausgeschlossene Ordner und exclude_paths-Treffer auflisten")
+    ] = False,
 ):
     """Quellordner aller Sammlungen erfassen und Dateien klassifizieren (nur lesend)."""
     a = get_app()
@@ -220,6 +229,11 @@ def scan_cmd(
         f"{st.files} Dateien, {human(st.bytes)} in {len(st.series)} Serien ({', '.join(st.collections)})  "
         f"(neu {st.new}, geändert {st.changed}, verschwunden {st.gone}, ausgeschlossen {st.excluded})"
     )
+    if st.dropped:
+        console.print(f"{st.dropped} nie archivierte, jetzt ausgeschlossene Einträge aus dem Index entfernt.")
+    if show_excluded:
+        for p in st.skipped:
+            console.print(f"  [dim]ausgeschlossen:[/] {escape(p)}", highlight=False)
 
 
 @app.command("hash")

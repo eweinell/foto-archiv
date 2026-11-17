@@ -83,7 +83,8 @@ id = "videos"                        # längere Videos: Diashows, Renderings
 source_root = "D:/Videos"
 profile = "media"                    # Klassen nur nach Endung: video, audio, img-original, other
 settle_days = 120                    # optional: eigene Ruhezeit
-exclude_dirs = ["proxy", "CacheClip"]  # optional: zusätzlich zu den globalen Mustern
+exclude_dirs = ["proxy", "CacheClip"]  # optional: Ordnernamen in jeder Tiefe (zusätzlich zu den globalen)
+exclude_paths = ["tmp", "2024.Hochzeit/veraltet", "*/Render-Cache"]  # optional: bestimmte Pfade samt Inhalt
 
 [[collections]]
 id = "musik"
@@ -99,6 +100,11 @@ year = "none"                        # keine Jahresebene: Musik/<Serie>/v1/…
 - Kurze Clips in einer Fotoserie bleiben in der Foto-Sammlung (Klasse `video`).
 - Liegt der Quellordner einer Sammlung innerhalb eines anderen (z. B. `Pictures/Diashows`), gehört er nur zur inneren Sammlung.
 - Ist ein Quellordner nicht verfügbar (externe Platte), überspringt `scan` die Sammlung; ihr Bestand gilt nicht als gelöscht.
+- **Ausschließen:** `exclude_paths` sind Pfade relativ zum Quellordner (Ordner oder Datei, Groß-/Kleinschreibung egal);
+  `*` und `?` gelten innerhalb eines Namens, `"*/veraltet"` trifft also `veraltet` direkt in jeder Serie. Für einen Namen in jeder Tiefe
+  `exclude_dirs` / `exclude_names`. `foto-archiv scan --excluded` listet, was übergangen wurde, `collections` zeigt die Regeln.
+  Wird nachträglich ausgeschlossen, verschwinden nie archivierte Einträge aus dem Index; bereits Archiviertes bleibt im
+  Archiv (und per `restore` erreichbar), gilt lokal aber als nicht vorhanden.
 - Pfade im Tar sind relativ zum Quellordner der Sammlung; `restore` entpackt standardmäßig dorthin.
 - Archivplatten mit **NTFS oder exFAT** formatieren: Videos > 4 GiB ergeben Pakete > 4 GiB; auf FAT32 bricht `seal` vorher ab.
 - Der Archivordner auf den HDDs heißt `foto-archiv` (`volume_dir` für neue Platten); umbenennen ist möglich,
